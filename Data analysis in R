@@ -1,0 +1,1141 @@
+# --- Packages ------------
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(plotly)
+library(ggh4x)
+
+# --- Paths ------------
+cells_csv <- "C:/.csv"
+tiles_csv <- "C:/.csv"
+sizes_csv <- "C:/.csv"
+
+stopifnot(file.exists(cells_csv), file.exists(tiles_csv), file.exists(sizes_csv))
+
+# --- Load data ------------
+cells <- read_csv(
+  cells_csv,
+  na = c("", "NA", "NaN"),
+  show_col_types = FALSE,
+  col_types = cols(
+    BaseAnnotation        = col_character(),
+    Source                = col_character(),
+    Index                 = col_double(),
+    CentroidX             = col_double(),
+    CentroidY             = col_double(),
+    CentroidZ             = col_double(),
+    H_flag                = col_double(),
+    PI_flag               = col_double(),
+    CAL_flag              = col_double(),
+    category7             = col_character(),
+    tripleClass           = col_character(),
+    R_PI_mean             = col_double(),
+    G_CAL_mean            = col_double(),
+    B_HOE_mean            = col_double(),
+    H_area_um2            = col_double(),
+    H_equiv_diam_um       = col_double(),
+    PI_area_um2           = col_double(),
+    PI_equiv_diam_um      = col_double(),
+    CAL_area_um2          = col_double(),
+    CAL_equiv_diam_um     = col_double(),
+    H_partners_PI_n       = col_double(),
+    H_partners_CAL_n      = col_double(),
+    H_triple_pairs_n      = col_double(),
+    H_partners_PI_ids     = col_character(),
+    H_partners_CAL_ids    = col_character()
+  )
+)
+
+
+
+tiles <- read_csv(
+  tiles_csv,
+  na = c("", "NA", "NaN"),
+  show_col_types = FALSE,
+  col_types = cols(
+    TileName                     = col_character(),
+    CentroidX                    = col_double(),
+    CentroidY                    = col_double(),
+    `Tile count Hoechst`         = col_double(),
+    `Tile count PI`              = col_double(),
+    `Tile count Calcein`         = col_double(),
+    `Tile union area PI (µm²)`   = col_double(),
+    `Tile union area CAL (µm²)`  = col_double(),
+    `Tile PI fraction`           = col_double(),
+    `Tile PI/CAL area ratio`     = col_double(),
+    `Tile passes filter (any channel ≥ min)` = col_double(),
+    `Tile BG area (µm²)`         = col_double(),
+    `Tile BG mean PI`            = col_double(),
+    `Tile BG mean Calcein`       = col_double(),
+    `Tile BG mean Hoechst`       = col_double(),
+    `Tile mean cell PI`          = col_double(),
+    `Tile mean cell Calcein`     = col_double(),
+    `Tile mean cell Hoechst`     = col_double(),
+    `Tile cell/BG ratio PI`      = col_double(),
+    `Tile cell/BG ratio Calcein` = col_double(),
+    `Tile cell/BG ratio Hoechst` = col_double(),
+     TileClass                   = col_character(),
+    `Tile PI class idx`          = col_double(),
+    `Tile area (µm²)`               = col_double(),
+    `Tile area fraction of full`    = col_double(),
+    `Tile occupied cell area (µm²)` = col_double()
+  )
+)
+
+
+sizes_df <- readr::read_csv(
+  sizes_csv,
+  na = c("", "NA", "NaN"),
+  show_col_types = FALSE,
+  col_types = cols(
+    BaseAnnotation= col_character(),
+    Source        = col_character(),  # expected: "H", "PI", "CAL"
+    Index         = col_double(),
+    CentroidX     = col_double(),
+    CentroidY     = col_double(),
+    CentroidZ     = col_character(),
+    Area_um2      = col_double(),
+    Equiv_diam_um = col_double()
+  )
+)
+
+# --- Colors ------------
+col_hoe <- "#3b82f6"  # blue
+col_pi  <- "#f44336"  # red
+col_cal <- "#4caf50"  # green
+
+# --- Global plotting settings ------------
+tile_size_um  <- 50
+pixel_size_um <- 0.853
+
+tile_w <- tile_size_um / pixel_size_um
+tile_h <- tile_size_um / pixel_size_um
+
+base_font_size <- 16
+title_font_size <- 18
+subtitle_font_size <- 14
+axis_title_font_size <- 14
+axis_text_font_size <- 13
+legend_text_font_size <- 12
+legend_title_font_size <- 13
+
+removed_tile_fill <- "#e5e5e5"
+
+theme_tilemap <- theme_minimal(base_size = base_font_size) +
+  theme(
+    panel.grid = element_blank(),
+    plot.title = element_text(size = title_font_size, face = "bold"),
+    plot.subtitle = element_text(size = subtitle_font_size),
+    axis.title = element_text(size = axis_title_font_size),
+    axis.text = element_text(size = axis_text_font_size),
+    legend.text = element_text(size = legend_text_font_size),
+    legend.title = element_text(size = legend_title_font_size)
+  )
+
+# --- Helper: reassign triple 'Several' H-cells to H+PI or H+CAL ----------
+choose_pair <- function(n_pi, n_cal, r_mean, g_mean) {
+  r_ok  <- is.finite(n_pi)  && n_pi  > 0
+  g_ok  <- is.finite(n_cal) && n_cal > 0
+  if (r_ok && !g_ok) return("H + PI")
+  if (!r_ok && g_ok) return("H + CAL")
+  if (is.finite(r_mean) && is.finite(g_mean)) {
+    if (r_mean >= g_mean) "H + PI" else "H + CAL"
+  } else {
+    "H + PI"  # fallback
+  }
+}
+
+# --- Tile categories used by tile-category plots ------------
+alive_max <- 0.30
+dead_min  <- 0.70
+
+if ("TileClass" %in% names(tiles)) {
+  tiles_cat <- tiles %>%
+    mutate(TileCategory = case_when(
+      grepl("Alive", TileClass, ignore.case = TRUE) ~ "Alive",
+      grepl("Mixed", TileClass, ignore.case = TRUE) ~ "Mixed",
+      grepl("Dead",  TileClass, ignore.case = TRUE) ~ "Dead",
+      TRUE ~ NA_character_
+    ))
+} else if ("Tile PI class idx" %in% names(tiles)) {
+  tiles_cat <- tiles %>%
+    mutate(TileCategory = case_when(
+      `Tile PI class idx` == 1 ~ "Alive",
+      `Tile PI class idx` == 2 ~ "Mixed",
+      `Tile PI class idx` == 3 ~ "Dead",
+      TRUE ~ NA_character_
+    ))
+} else {
+  stop("Neither 'TileClass' nor 'Tile PI class idx' found in tiles CSV.")
+}
+
+tile_cols <- c(
+  Alive = col_cal,
+  Mixed = "#ffc107",
+  Dead  = col_pi
+)
+
+# --- Check required columns ---
+req_tile_area_cols <- c("Tile area (µm²)", "Tile BG area (µm²)", "Tile passes filter (any channel ≥ min)") 
+
+
+# === 1. Cell size histograms by channel (x-axis = sqrt(area) in µm) ===
+
+sizes_plot <- sizes_df %>%
+  filter(Source %in% c("H","PI","CAL"),
+         is.finite(Area_um2), Area_um2 > 0) %>%
+  mutate(
+    Channel = dplyr::recode(Source, "H"="Hoechst","CAL"="Calcein","PI"="PI"),
+    Channel = factor(Channel, levels = c("Hoechst","Calcein","PI")),
+    sqrt_area_um = sqrt(Area_um2)
+  )
+
+p1 <- ggplot(sizes_plot, aes(x = sqrt_area_um, fill = Channel)) +
+  geom_histogram(
+    bins = 30, boundary = 0, closed = "left",
+    color = "black", linewidth = 0.25, show.legend = FALSE
+  ) +
+  facet_wrap(~ Channel, nrow = 1, scales = "fixed") +
+  scale_fill_manual(values = c(Hoechst = col_hoe, Calcein = col_cal, PI = col_pi)) +
+  labs(
+    title = "Cell size distributions by channel",
+    subtitle = "X-axis is √(area) in micrometers",
+    x = expression(sqrt(area)~"(" * mu * "m)"),
+    y = "Count"
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+print(p1)
+
+
+# === 2. Detections per tile (hide zero bar; annotate zero count) — shared y-axis ===
+
+needed_counts <- c("Tile count Hoechst", "Tile count PI", "Tile count Calcein")
+miss <- setdiff(needed_counts, names(tiles))
+if (length(miss)) stop("Missing columns in tiles CSV: ", paste(miss, collapse = ", "))
+
+count_label_map <- c(
+  `Tile count Hoechst` = "Hoechst",
+  `Tile count PI`      = "PI",
+  `Tile count Calcein` = "Calcein"
+)
+
+counts_long <- tiles %>%
+  dplyr::select(dplyr::all_of(names(count_label_map))) %>%
+  tidyr::pivot_longer(
+    dplyr::everything(),
+    names_to = "ChannelCol", values_to = "cell_count"
+  ) %>%
+  dplyr::mutate(
+    Channel = dplyr::recode(ChannelCol, !!!count_label_map),
+    Channel = factor(Channel, levels = c("Hoechst", "Calcein", "PI"))
+  ) %>%
+  dplyr::filter(is.finite(cell_count), cell_count >= 0)
+
+# Count zeros per channel for annotation
+zero_counts <- counts_long %>%
+  dplyr::filter(cell_count == 0) %>%
+  dplyr::count(Channel, name = "n_zero")
+
+# Nonzero counts for the histogram
+counts_long_nz <- counts_long %>%
+  dplyr::filter(cell_count > 0)
+
+# Ensure each facet gets a label row
+zero_counts <- counts_long %>%
+  dplyr::distinct(Channel) %>%
+  dplyr::left_join(zero_counts, by = "Channel") %>%
+  dplyr::mutate(n_zero = dplyr::coalesce(n_zero, 0L))
+
+# Per-channel max bar height
+label_pos <- counts_long_nz %>%
+  dplyr::group_by(Channel, cell_count) %>%
+  dplyr::summarise(n = dplyr::n(), .groups = "drop_last") %>%
+  dplyr::summarise(y_max = max(n), .groups = "drop") %>%
+  dplyr::left_join(zero_counts, by = "Channel") %>%
+  dplyr::mutate(
+    x_lab = 1,  # label above first visible bin
+    lab   = paste0("0s: ", n_zero)
+  )
+
+# GLOBAL y-limit shared across facets
+global_ymax <- if (nrow(label_pos)) max(label_pos$y_max, na.rm = TRUE) else 0
+pad <- if (global_ymax > 0) global_ymax * 0.12 else 1
+
+# put labels a touch below the top across all facets
+label_pos$y_lab <- global_ymax + pad * 0.35
+
+# x limit (leave room for label)
+x_max <- max(counts_long$cell_count, na.rm = TRUE)
+x_max <- if (is.finite(x_max) && x_max >= 1) x_max else 1
+
+p2 <- ggplot(counts_long_nz, aes(x = cell_count, fill = Channel)) +
+  geom_histogram(binwidth = 1, boundary = 0.5, closed = "left",
+                 color = "black", linewidth = 0.25, show.legend = FALSE) +
+  geom_text(
+    data = label_pos,
+    aes(x = x_lab, y = y_lab, label = lab),
+    inherit.aes = FALSE,
+    size = 3.4, fontface = "bold", hjust = 0
+  ) +
+  facet_wrap(~ Channel, nrow = 1) +  # <- shared y-axis (removed scales="free_y")
+  coord_cartesian(xlim = c(1, x_max + 0.5),
+                  ylim = c(0, global_ymax + pad)) +  # <- common y-limit so text is inside
+  scale_x_continuous(breaks = scales::breaks_pretty(n = 8),
+                     expand = expansion(mult = c(0, 0.02))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = c(Hoechst = col_hoe, PI = col_pi, Calcein = col_cal)) +
+  labs(
+    title = "Detections per tile by channel",
+    subtitle = "Zero-count tiles are omitted from bars and shown as “0s: N”",
+    x = "Detections per tile (cells)", y = "Tiles"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+print(p2)
+
+
+
+# === 3. Overview of categorized cells ===
+
+cells_adj <- cells %>%
+  rowwise() %>%
+  mutate(
+    category7_adj = {
+      if (Source == "H" && category7 == "H + PI + CAL") {
+        if (!is.na(tripleClass) && tripleClass == "Single") {
+          "H + PI + CAL"
+        } else {
+          choose_pair(H_partners_PI_n, H_partners_CAL_n, R_PI_mean, G_CAL_mean)
+        }
+      } else {
+        category7
+      }
+    }
+  ) %>%
+  ungroup()
+
+label_map <- c(
+  "H only"       = "Hoechst only",
+  "CAL only"     = "Calcein only",
+  "PI only"      = "PI only",
+  "H + PI"       = "Hoechst / PI",
+  "H + CAL"      = "Hoechst / Calcein",
+  "PI + CAL"     = "Calcein / PI",
+  "H + PI + CAL" = "Hoechst / Calcein / PI"
+)
+cat_order <- c(
+  "Hoechst only", "Calcein only", "PI only",
+  "Hoechst / PI", "Hoechst / Calcein", "Calcein / PI",
+  "Hoechst / Calcein / PI"
+)
+
+cat_df <- cells_adj %>%
+  mutate(Category = recode(category7_adj, !!!label_map)) %>%
+  filter(!is.na(Category) & Category %in% unname(label_map)) %>%
+  count(Category, name = "Count") %>%
+  mutate(Percent = 100 * Count / sum(Count),
+         Category = factor(Category, levels = cat_order))
+
+cat_cols <- c(
+  "Hoechst only"               = col_hoe,
+  "Calcein only"               = col_cal,
+  "PI only"                    = col_pi,
+  "Hoechst / PI"               = "#8f6af7",
+  "Hoechst / Calcein"          = "#46b0c2",
+  "Calcein / PI"               = "#c6b600",
+  "Hoechst / Calcein / PI"     = "#9e9e9e"
+)
+
+
+# --- Non-overlapping outside labels for small slices -------------------------
+thr_small <- 5     # % threshold for outside labels
+min_gap   <- 3     # minimum vertical separation between labels in % points
+
+# --- geometry for a pie made with geom_col(width = 1) ---
+pie_x_center <- 1.0
+pie_width    <- 1.0
+r_inner      <- pie_x_center - pie_width/2   # 0.5
+r_outer      <- pie_x_center + pie_width/2   # 1.5
+
+
+pie_labs <- cat_df %>%
+  arrange(desc(Category)) %>%
+  mutate(
+    lbl    = paste0(round(Percent, 1), "%"),
+    y_mid  = cumsum(Percent) - Percent/2,
+    small  = Percent < thr_small,
+    x_start = r_outer,          # start at outer rim
+    x_tick  = r_outer + 0.10,   # short line outside
+    x_label = r_outer + 0.22    # text a bit further out
+  )
+
+# De-overlap only the 'small' labels by enforcing a minimum spacing along y
+spread_small_labels <- function(y, gap = 3, y_min = 0, y_max = 100) {
+  y <- sort(y)
+  if (!length(y)) return(y)
+  ys <- y
+  for (i in 2:length(ys)) {
+    if (ys[i] - ys[i-1] < gap) ys[i] <- ys[i-1] + gap
+  }
+  ys <- pmin(ys, y_max)                # clamp at top
+  # optional: push back down if we ran into the ceiling
+  for (i in (length(ys)-1):1) {
+    if (ys[i+1] - ys[i] < gap) ys[i] <- ys[i+1] - gap
+  }
+  ys <- pmax(ys, y_min)                # clamp at bottom
+  # put back in original order
+  out <- numeric(length(y))
+  out[order(order(y))] <- ys
+  out
+}
+
+small_idx <- which(pie_labs$small)
+pie_labs$y_out <- pie_labs$y_mid
+if (length(small_idx)) {
+  pie_labs$y_out[small_idx] <- spread_small_labels(
+    pie_labs$y_mid[small_idx],
+    gap = min_gap,
+    y_min = 0 + 1.0,     # keep a little margin from 0%
+    y_max = 100 - 1.0    # ...and from 100%
+  )
+}
+
+# Rebuild your pie and add labels/segments using y_out for small slices
+p3 <- ggplot(cat_df, aes(x = "", y = Percent, fill = Category)) +
+  geom_col(color = "black", linewidth = 0.25, width = 1) +
+  coord_polar(theta = "y", clip = "off") +
+  scale_fill_manual(values = cat_cols, name = NULL) +
+  labs(title = "Categorized cells — pie (triple 'Several' reassigned)",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "right",
+        plot.title = element_text(hjust = 0.5),
+        plot.margin = margin(10, 80, 10, 10)) +  # extra room on the right
+  # inside labels for large slices
+  geom_text(
+    data = subset(pie_labs, !small),
+    aes(x = (r_inner + r_outer)/2, y = y_mid, label = lbl),
+    inherit.aes = FALSE,
+    size = 3.2, fontface = "bold", color = "black"
+  ) +
+  # connector from slice center to de-overlapped y position
+  geom_segment(
+    data = subset(pie_labs, small),
+    aes(x = x_start, y = y_mid, xend = x_tick, yend = y_out),
+    inherit.aes = FALSE,
+    linewidth = 0.5, color = "black", lineend = "round"
+  ) +
+  # small dog-leg to the text
+  geom_segment(
+    data = subset(pie_labs, small),
+    aes(x = x_tick, y = y_out, xend = x_tick + 0.06, yend = y_out),
+    inherit.aes = FALSE,
+    linewidth = 0.4, color = "black", lineend = "round"
+  ) +
+  # outside labels at de-overlapped y positions
+  geom_label(
+    data = subset(pie_labs, small),
+    aes(x = x_label, y = y_out, label = lbl),
+    inherit.aes = FALSE,
+    hjust = 0, size = 3.0, fontface = "bold",
+    linewidth = 0.2, label.padding = unit(0.15, "lines"),
+    fill = "white", color = "black"
+  )
+
+print(p3)
+
+
+# === 4. 3D RGB scatter of per-cell intensities (R,G,B) ===
+
+# Build a display Category on the per-cell rows
+cells_adj_disp <- cells_adj %>%
+  mutate(Category = recode(category7_adj, !!!label_map))
+
+# Mark the subset that were originally H+PI+CAL but NOT "Single"
+triple_reassigned <- with(
+  cells_adj_disp,
+  Source == "H" & category7 == "H + PI + CAL" & (is.na(tripleClass) | tripleClass != "Single")
+)
+# Create plot-only adjusted intensities
+cells_adj_disp <- cells_adj_disp %>%
+  mutate(
+    R_adj = R_PI_mean,
+    G_adj = G_CAL_mean,
+    B_adj = B_HOE_mean
+  ) %>%
+  mutate(
+    # If this was a reassigned triple 'Several' H-cell:
+    R_adj = ifelse(triple_reassigned & category7_adj == "H + CAL", 0, R_adj),  # losing PI -> 0
+    G_adj = ifelse(triple_reassigned & category7_adj == "H + PI",  0, G_adj)   # losing CAL -> 0
+  ) %>%
+  # Replace remaining NA with 0 so every point has coordinates
+  mutate(
+    R_adj = ifelse(is.na(R_adj), 0, R_adj),
+    G_adj = ifelse(is.na(G_adj), 0, G_adj),
+    B_adj = ifelse(is.na(B_adj), 0, B_adj)
+  ) %>%
+  mutate(
+    Source = factor(Source, levels = c("H", "PI+CAL(no H)", "PI", "CAL")),
+    Category = factor(Category, levels = c(
+      "Hoechst only","Calcein only","PI only",
+      "Hoechst / PI","Hoechst / Calcein","Calcein / PI",
+      "Hoechst / Calcein / PI"
+    ))
+  )
+
+# Color palette aligned with your request
+cat_colors <- c(
+  "Hoechst only"              = "#3b82f6",  # blue
+  "Calcein only"              = "#4caf50",  # green
+  "PI only"                   = "#f44336",  # red
+  "Hoechst / PI"              = "#8f6af7",  # bluish-purple
+  "Hoechst / Calcein"         = "#46b0c2",  # teal
+  "Calcein / PI"              = "#c6b600",  # yellow-olive
+  "Hoechst / Calcein / PI"    = "#9e9e9e"   # gray
+)
+
+# Shapes per source
+symbol_map <- c("H"="circle","PI+CAL(no H)"="diamond","PI"="square","CAL"="triangle-up")
+
+# Hover text
+cells_adj_disp$hover <- sprintf(
+  "Ann: %s<br>Src: %s<br>Cat: %s<br>R=%.1f, G=%.1f, B=%.1f",
+  cells_adj_disp$BaseAnnotation, cells_adj_disp$Source, cells_adj_disp$Category,
+  cells_adj_disp$R_adj, cells_adj_disp$G_adj, cells_adj_disp$B_adj
+)
+
+p4 <- plot_ly(
+  cells_adj_disp,
+  x = ~R_adj, y = ~G_adj, z = ~B_adj,
+  type = "scatter3d", mode = "markers",
+  color = ~Category, colors = cat_colors,
+  symbol = ~Source, symbols = symbol_map,
+  text = ~hover, hoverinfo = "text",
+  marker = list(size = 2, opacity = 0.7)
+) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "R (PI mean, adjusted)", rangemode = "tozero"),
+      yaxis = list(title = "G (Calcein mean, adjusted)", rangemode = "tozero"),
+      zaxis = list(title = "B (Hoechst mean)", rangemode = "tozero")
+    ),
+    legend = list(itemsizing = "constant")
+  )
+
+print(p4)
+
+
+# === 5. Number of tiles kept vs removed ===
+req_keepcol <- "Tile passes filter (any channel ≥ min)"
+if (!req_keepcol %in% names(tiles)) {
+  stop("Missing column in tiles CSV: 'Tile passes filter (any channel ≥ min)'. Re-export from QuPath.")
+}
+
+tiles_keep <- tiles %>%
+  transmute(KeepFlag = !!sym(req_keepcol)) %>%
+  mutate(Status = ifelse(KeepFlag == 1, "Kept", "Removed"))
+
+keep_counts <- tiles_keep %>%
+  count(Status, name = "Tiles") %>%
+  mutate(Percent = 100 * Tiles / sum(Tiles),
+         Status  = factor(Status, levels = c("Kept","Removed")))
+
+# Optional: print counts to console
+print(keep_counts)
+
+p5 <- ggplot(keep_counts, aes(x = Status, y = Tiles, fill = Status)) +
+  geom_col(color = "black", linewidth = 0.25, width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = paste0(Tiles, " (", round(Percent, 1), "%)")),
+            vjust = -0.4, size = 3.8) +
+  scale_fill_manual(values = c(Kept = "#4caf50", Removed = "#f44336")) +
+  labs(
+    title = "Tiles kept vs removed",
+    subtitle = "Kept if any channel reached the minimum per-tile detection threshold",
+    x = NULL, y = "Number of tiles"
+  ) +
+  ylim(0, max(keep_counts$Tiles) * 1.12) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+print(p5)
+
+
+# === 6. Tile fractions (cell coverage vs background), ONLY kept tiles ===
+
+# 1) Check required columns
+miss <- setdiff(req_tile_area_cols, names(tiles))
+if (length(miss)) stop("Missing columns in tiles CSV: ", paste(miss, collapse = ", "))
+
+# 2) Keep only tiles that passed the filter
+tiles_kept_only <- tiles %>%
+  dplyr::filter(`Tile passes filter (any channel ≥ min)` == 1)
+
+if (nrow(tiles_kept_only) == 0) {
+  stop("No kept tiles found (Tile passes filter == 1).")
+}
+
+# 3) Compute fractions on kept tiles
+coverage_df <- tiles_kept_only %>%
+  dplyr::transmute(
+    tile_area_um2 = `Tile area (µm²)`,
+    bg_area_um2   = `Tile BG area (µm²)`,
+    cell_area_um2 = pmax(tile_area_um2 - bg_area_um2, 0),
+    Fraction      = dplyr::if_else(tile_area_um2 > 0, cell_area_um2 / tile_area_um2, NA_real_),
+    Metric        = "Cell coverage"
+  )
+
+bgfrac_df <- tiles_kept_only %>%
+  dplyr::transmute(
+    tile_area_um2 = `Tile area (µm²)`,
+    bg_area_um2   = `Tile BG area (µm²)`,
+    Fraction      = dplyr::if_else(tile_area_um2 > 0, bg_area_um2 / tile_area_um2, NA_real_),
+    Metric        = "Background fraction"
+  )
+
+# 4) Combine & clean
+cov_long <- dplyr::bind_rows(coverage_df, bgfrac_df) %>%
+  dplyr::filter(is.finite(Fraction)) %>%
+  dplyr::mutate(
+    Fraction = pmin(pmax(Fraction, 0), 1),  # clamp to [0,1] just in case
+    Metric   = factor(Metric, levels = c("Cell coverage", "Background fraction"))
+  )
+
+if (nrow(cov_long) == 0) {
+  stop("No finite fraction values among kept tiles.")
+}
+
+# 5) Plot: side-by-side facets; y fits per facet
+p6 <- ggplot(cov_long, aes(x = Fraction, fill = Metric)) +
+  geom_histogram(bins = 30, boundary = 0, closed = "left",
+                 color = "black", linewidth = 0.25, show.legend = FALSE) +
+  facet_wrap(~ Metric, nrow = 1, scales = "free_y") +  # side-by-side; y fits facet data
+  scale_x_continuous(labels = scales::percent, limits = c(0, 1),
+                     expand = expansion(mult = c(0, 0))) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.04))) +  # tidy top padding
+  scale_fill_manual(values = c("Cell coverage" = "#8c8c8c",
+                               "Background fraction" = "#d9d9d9")) +
+  labs(
+    title = "Tile area fractions (kept tiles only)",
+    subtitle = "Coverage = (Tile − Background) / Tile    •    Background = Background / Tile",
+    x = "Fraction of tile", y = "Tiles"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+print(p6)
+
+
+
+# --- Build kept-tiles DF with fractions & order by cell coverage ---
+miss <- setdiff(req_tile_area_cols, names(tiles))
+if (length(miss)) stop("Missing columns in tiles CSV: ", paste(miss, collapse = ", ")) 
+
+df_keep <- tiles %>%
+  dplyr::filter(`Tile passes filter (any channel ≥ min)` == 1) %>%
+  dplyr::transmute(
+    cell_fraction = pmax(pmin((`Tile area (µm²)` - `Tile BG area (µm²)`) / `Tile area (µm²)`, 1), 0),
+    bg_fraction   = pmax(pmin(`Tile BG area (µm²)` / `Tile area (µm²)`, 1), 0)
+  ) %>%
+  dplyr::filter(is.finite(cell_fraction), is.finite(bg_fraction))
+
+# order tiles by cell_fraction (low -> high)
+ord <- order(df_keep$cell_fraction)
+df_keep <- df_keep[ord, , drop = FALSE]
+df_keep$idx <- seq_len(nrow(df_keep))
+
+# long format for stacked columns
+df_long <- tidyr::pivot_longer(
+  df_keep,
+  cols = c(cell_fraction, bg_fraction),
+  names_to = "Part", values_to = "Frac"
+) %>%
+  dplyr::mutate(
+    Part = factor(Part,
+                  levels = c("bg_fraction", "cell_fraction"),
+                  labels = c("Background", "Cells"))
+  )
+
+# --- Plot: stacked “waterfall” with a white dividing line ---
+p6b <- ggplot(df_long, aes(x = idx, y = Frac, fill = Part)) +
+  geom_col(width = 1, position = "stack", color = NA) +
+  # white divider at the cell/background boundary
+  geom_line(
+    data = df_keep,
+    aes(x = idx, y = cell_fraction, group = 1),
+    inherit.aes = FALSE,
+    color = "white", linewidth = 0.4
+  ) +
+  scale_fill_manual(values = c(Background = "#d9d9d9", Cells = "#4caf50")) +
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "Tile fractions per kept tile (sorted by cell coverage)",
+    subtitle = "Cell coverage = (Tile area − Background area) / Tile area\nBackground fraction = Background area / Tile area",
+    x = "Tiles (sorted by cell coverage)", y = "Fraction of tile"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    legend.position = "right"
+  )
+
+print(p6b)
+
+
+
+# === 7. Tile-wise cell/BG ratio histograms (per channel) ===
+
+needed_ratios <- c("Tile cell/BG ratio Hoechst",
+                   "Tile cell/BG ratio PI",
+                   "Tile cell/BG ratio Calcein")
+miss_r <- setdiff(needed_ratios, names(tiles))
+if (length(miss_r)) {
+  stop("Missing ratio columns in tiles CSV (expected from updated QuPath export): ",
+       paste(miss_r, collapse = ", "))
+}
+
+ratios_long <- tiles %>%
+  transmute(`Hoechst` = `Tile cell/BG ratio Hoechst`,
+            `PI`      = `Tile cell/BG ratio PI`,
+            `Calcein` = `Tile cell/BG ratio Calcein`) %>%
+  pivot_longer(everything(), names_to = "Channel", values_to = "Ratio") %>%
+  filter(is.finite(Ratio), Ratio >= 0) %>%
+  mutate(Channel = factor(Channel, levels = c("Hoechst","Calcein","PI")))
+
+# keep only positive ratios and pre-transform
+ratios_long_log <- ratios_long %>%
+  dplyr::filter(is.finite(Ratio), Ratio > 0) %>%
+  dplyr::mutate(logR = log10(Ratio))
+
+p7 <- ggplot(ratios_long_log, aes(x = logR, fill = Channel)) +
+  geom_histogram(bins = 40, color = "black", linewidth = 0.25, show.legend = FALSE) +
+  ggh4x::facet_wrap2(~ Channel, nrow = 1, scales = "free_x") +
+  ggh4x::facetted_pos_scales(
+    x = list(
+      Channel == "Hoechst" ~ scale_x_continuous(breaks = scales::breaks_pretty(n = 6),
+                                                expand = expansion(mult = c(0, 0.02))),
+      Channel == "Calcein" ~ scale_x_continuous(breaks = scales::breaks_pretty(n = 6),
+                                                expand = expansion(mult = c(0, 0.02))),
+      Channel == "PI"      ~ scale_x_continuous(breaks = scales::breaks_pretty(n = 6),
+                                                expand = expansion(mult = c(0, 0.02)))
+    )
+  ) +
+  scale_fill_manual(values = c(Hoechst = col_hoe, PI = col_pi, Calcein = col_cal)) +
+  labs(
+    title = "Distribution of tile-wise cell/BG intensity ratios",
+    subtitle = "X-axis is log10(ratio)",
+    x = "log10(Cell mean / Background mean)", y = "Tiles"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"))
+
+print(p7)
+
+
+# === 8. Per-cell vs per-tile background intensities (density-scaled histograms) ===
+
+# Build a long table with per-tile background means & per-tile cell means
+int_long <- tiles %>%
+  transmute(
+    Hoechst_BG   = `Tile BG mean Hoechst`,
+    Hoechst_Cell = `Tile mean cell Hoechst`,
+    PI_BG        = `Tile BG mean PI`,
+    PI_Cell      = `Tile mean cell PI`,
+    Calcein_BG   = `Tile BG mean Calcein`,
+    Calcein_Cell = `Tile mean cell Calcein`
+  ) %>%
+  tidyr::pivot_longer(everything(), names_to = "name", values_to = "Intensity") %>%
+  tidyr::separate(name, into = c("Channel","Kind"), sep = "_", remove = TRUE) %>%
+  mutate(
+    Kind    = dplyr::recode(Kind, "BG" = "Background", "Cell" = "Cell"),
+    Channel = factor(Channel, levels = c("Hoechst","Calcein","PI"))
+  ) %>%
+  filter(is.finite(Intensity), Intensity >= 0)
+
+# Per-channel fill color for the Cell layer; background stays gray
+int_long <- int_long %>%
+  mutate(
+    CellFill = dplyr::case_when(
+      Channel == "Hoechst" ~ col_hoe,
+      Channel == "Calcein" ~ col_cal,
+      Channel == "PI"      ~ col_pi,
+      TRUE ~ "#777777"
+    )
+  )
+
+# Density-scaled overlayed histograms (gray = background, color = cells)
+p8 <- ggplot() +
+  # Background layer in light gray
+  geom_histogram(
+    data = subset(int_long, Kind == "Background"),
+    aes(x = Intensity, y = after_stat(density)),
+    bins = 40, fill = "#d9d9d9", color = "black", linewidth = 0.2, alpha = 0.9
+  ) +
+  # Cell layer in channel color
+  geom_histogram(
+    data = subset(int_long, Kind == "Cell"),
+    aes(x = Intensity, y = after_stat(density), fill = CellFill),
+    bins = 40, color = "black", linewidth = 0.2, alpha = 0.55, show.legend = FALSE
+  ) +
+  ggh4x::facet_wrap2(~ Channel, nrow = 1, scales = "free_x") +
+  scale_fill_identity() +
+  labs(
+    title = "Per-cell vs per-tile background intensities (density-scaled histograms)",
+    subtitle = "Gray = Background mean intensity; Color = Cell mean intensity",
+    x = "Mean intensity", y = "Density"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+
+print(p8)
+
+# === 9. Histogram of tile PI fractions ===
+
+stopifnot("Tile PI fraction" %in% names(tiles))
+
+pi_frac_df <- tiles %>%
+  transmute(pi_frac = `Tile PI fraction`) %>%
+  filter(is.finite(pi_frac), pi_frac >= 0, pi_frac <= 1)
+stopifnot(nrow(pi_frac_df) > 0)
+
+
+p9 <- ggplot(pi_frac_df, aes(x = pi_frac)) +
+  # pastel background bands (use -Inf to Inf, higher alpha)
+  annotate(
+    "rect",
+    xmin = 0, xmax = alive_max, ymin = -Inf, ymax = Inf,
+    fill = "#E6F4EA", alpha = 0.35
+  ) +
+  annotate(
+    "rect",
+    xmin = alive_max, xmax = dead_min, ymin = -Inf, ymax = Inf,
+    fill = "#FFF1CD", alpha = 0.25
+  ) +
+  annotate(
+    "rect",
+    xmin = dead_min, xmax = 1, ymin = -Inf, ymax = Inf,
+    fill = "#FDE2E1", alpha = 0.25
+  ) +
+  # histogram (slightly transparent so background shows through)
+  geom_histogram(
+    bins = 30, boundary = 0, closed = "left",
+    color = "black", linewidth = 0.25,
+    fill = "#999999", alpha = 0.7
+  ) +
+  # dashed guides
+  geom_vline(xintercept = alive_max, linetype = "dashed") +
+  geom_vline(xintercept = dead_min,  linetype = "dashed") +
+  scale_x_continuous(limits = c(0, 1)) +
+  scale_y_continuous(
+    limits = c(0, NA),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Tile-wise PI fraction distribution",
+    subtitle = paste0(
+      "Calculation: PIfrac = PI area / (PI area + Calcein area)",
+      "\n• Alive: < ", alive_max,
+      "  • Mixed: [", alive_max, ", ", dead_min, ")",
+      "  • Dead: ≥ ", dead_min
+    ),
+    x = "PI fraction (PI area / (PI area + Calcein area))",
+    y = "Tiles"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+print(p9)
+
+
+# === 10. ECDF of Tile PI fraction ===
+
+stopifnot("Tile PI fraction" %in% names(tiles))
+
+ecdf_df <- tiles %>%
+  transmute(pi_frac = `Tile PI fraction`) %>%
+  filter(is.finite(pi_frac), pi_frac >= 0, pi_frac <= 1)
+
+p10 <- ggplot(ecdf_df, aes(x = pi_frac)) +
+  stat_ecdf(geom = "step", linewidth = 0.8) +
+  geom_vline(xintercept = c(alive_max, dead_min), linetype = "dashed") +
+  scale_x_continuous(limits = c(0, 1)) +
+  labs(
+    title = "ECDF of tile PI fraction",
+    subtitle = paste0("Dashed: alive < ", alive_max, " | dead ≥ ", dead_min),
+    x = "PI fraction", y = "Cumulative proportion of tiles"
+  ) +
+  theme_minimal(base_size = 12)
+
+print(p10)
+
+
+# === 11. Continuous map: Tile PI fraction ===
+
+stopifnot("Tile PI fraction" %in% names(tiles))
+
+tiles_plot_pi <- tiles %>%
+  mutate(
+    Kept = ifelse(`Tile passes filter (any channel ≥ min)` == 1, "Kept", "Removed")
+  )
+
+tiles_removed_pi <- dplyr::filter(tiles_plot_pi, Kept == "Removed")
+tiles_kept_pi    <- dplyr::filter(tiles_plot_pi, Kept == "Kept")
+
+p11 <- ggplot() +
+  geom_tile(
+    data = tiles_removed_pi,
+    aes(x = CentroidX, y = CentroidY),
+    width = tile_w, height = tile_h,
+    fill = removed_tile_fill,
+    color = "white", linewidth = 0.02,
+    show.legend = FALSE
+  ) +
+  geom_tile(
+    data = tiles_kept_pi,
+    aes(x = CentroidX, y = CentroidY, fill = `Tile PI fraction`),
+    width = tile_w, height = tile_h,
+    color = "white", linewidth = 0.10
+  ) +
+  scale_fill_viridis_c(
+    option = "magma",
+    end = 0.95,
+    direction = -1,
+    na.value = removed_tile_fill,
+    breaks = c(0, 0.25, 0.5, 0.75, 1),
+    labels = c("0.00 (alive)", "0.25", "0.5", "0.75", "1 (dead)")
+  ) +
+  guides(fill = guide_colorbar(
+    title = "PI frac",
+    title.position = "top",
+    title.hjust = 0.1,
+    barheight = grid::unit(70, "pt"),
+    barwidth  = grid::unit(18, "pt"),
+    ticks = TRUE
+  )) +
+  coord_fixed() +
+  scale_y_reverse(expand = expansion(mult = c(0.02, 0.02))) +
+  labs(
+    title = "Continuous map of tile PI fraction",
+    subtitle = paste0(
+      "PI frac = PI area / (PI area + Calcein area)",
+      "\nKept tiles colored by PI fraction; removed tiles shown in grey"
+    ),
+    x = "X (pixels)", y = "Y (pixels)", fill = NULL
+  ) +
+  theme_tilemap
+
+print(p11)
+
+# === 12. Heatmap of tile categorization over the annotation ===
+
+tiles_plot <- tiles_cat %>%
+  mutate(
+    Base = sub(" (—|-) Tile.*$", "", TileName),
+    TileCategory = trimws(as.character(TileCategory)),
+    ShowColor = (`Tile passes filter (any channel ≥ min)` == 1) &
+      is.finite(`Tile PI fraction`) &
+      !is.na(TileCategory)
+  )
+
+# percentage of removed tiles among all tiles
+removed_pct <- mean(!tiles_plot$ShowColor) * 100
+removed_lab <- paste0("Removed (", round(removed_pct, 1), "%)")
+
+tiles_plot <- tiles_plot %>%
+  mutate(
+    TileCategoryPlot = ifelse(ShowColor, TileCategory, removed_lab),
+    TileCategoryPlot = factor(
+      TileCategoryPlot,
+      levels = c("Alive", "Mixed", "Dead", removed_lab)
+    )
+  )
+
+tile_cols_plot <- c(
+  Alive = col_cal,
+  Mixed = "#ffc107",
+  Dead = col_pi,
+  setNames(removed_tile_fill, removed_lab)
+)
+
+p12 <- ggplot() +
+  geom_tile(
+    data = tiles_plot,
+    aes(x = CentroidX, y = CentroidY, fill = TileCategoryPlot),
+    width = tile_w, height = tile_h,
+    color = "white", linewidth = 0.15
+  ) +
+  scale_fill_manual(values = tile_cols_plot, name = "Tile category", drop = FALSE) +
+  coord_fixed() +
+  scale_y_reverse(expand = expansion(mult = c(0.02, 0.02))) +
+  labs(
+    title = "Tile categorization map",
+    subtitle = paste0(
+      "Kept tiles categorized by finite PI fraction; removed tiles shown in grey",
+      "\nPI fraction: Alive < ", alive_max,
+      "   Mixed [", alive_max, ", ", dead_min, ")",
+      "   Dead ≥ ", dead_min
+    ),
+    x = "X (pixels)", y = "Y (pixels)"
+  ) +
+  theme_tilemap
+
+if (length(unique(tiles_plot$Base)) > 1) {
+  p12 <- p12 + facet_wrap(~ Base, scales = "fixed")
+}
+
+print(p12)
+
+
+# === 13. Overview of categorized tiles ===
+
+cat3_df <- tiles_cat %>%
+  mutate(
+    TileCategory = trimws(as.character(TileCategory)),
+    ShowColor = (`Tile passes filter (any channel ≥ min)` == 1) &
+      is.finite(`Tile PI fraction`) &
+      !is.na(TileCategory)
+  ) %>%
+  filter(ShowColor) %>%
+  count(TileCategory, name = "Count") %>%
+  mutate(
+    Percent = 100 * Count / sum(Count),
+    TileCategory = factor(TileCategory, levels = c("Alive","Mixed","Dead"))
+  )
+
+#Pie with outside callouts starting at rim
+p13 <- ggplot(cat3_df, aes(x = "", y = Percent, fill = TileCategory)) +
+  geom_col(color = "black", linewidth = 0.25, width = 1) +
+  scale_fill_manual(values = tile_cols, name = NULL) +
+  labs(
+    title = "Tile categories — pie",
+    subtitle = paste0(
+      "Kept tiles with finite PI fraction only",
+      "\nPI fraction: Alive < ", alive_max,
+      "   Mixed [", alive_max, ", ", dead_min, ")",
+      "   Dead ≥ ", dead_min
+    ),
+    x = NULL, y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "right",
+        plot.title = element_text(hjust = 0.5))
+
+# --- callout geometry (same logic as for p3b) ---
+thr_small <- 5  # % threshold for outside labels
+
+# For geom_col(width=1), the pie is centered at x=1:
+pie_x_center <- 1.0
+pie_width    <- 1.0
+r_inner      <- pie_x_center - pie_width/2  # 0.5
+r_outer      <- pie_x_center + pie_width/2  # 1.5
+
+tile_pie_labs <- cat3_df %>%
+  arrange(desc(TileCategory)) %>%
+  mutate(
+    lbl     = paste0(round(Percent, 1), "%"),
+    y_mid   = cumsum(Percent) - Percent/2,
+    small   = Percent < thr_small,
+    x_start = r_outer,         # start callout at the outer rim
+    x_tick  = r_outer + 0.12,  # short line outside
+    x_label = r_outer + 0.22   # label a bit further out
+  )
+
+# Add callouts & labels; clip off so labels can extend outside
+p13 <- p13 +
+  # inside labels for large slices (optional)
+  geom_text(
+    data = subset(tile_pie_labs, !small),
+    aes(x = (r_inner + r_outer)/2, y = y_mid, label = lbl),
+    inherit.aes = FALSE,
+    size = 3.2, fontface = "bold", color = "black"
+  ) +
+  # outside callout lines for small slices
+  geom_segment(
+    data = subset(tile_pie_labs, small),
+    aes(x = x_start, xend = x_tick, y = y_mid, yend = y_mid),
+    inherit.aes = FALSE,
+    linewidth = 0.5, color = "black", lineend = "round"
+  ) +
+  geom_segment( # small dog-leg for readability (optional)
+    data = subset(tile_pie_labs, small),
+    aes(x = x_tick, xend = x_tick + 0.06, y = y_mid, yend = y_mid),
+    inherit.aes = FALSE,
+    linewidth = 0.4, color = "black", lineend = "round"
+  ) +
+  geom_text(
+    data = subset(tile_pie_labs, small),
+    aes(x = x_label, y = y_mid, label = lbl),
+    inherit.aes = FALSE,
+    hjust = 0, size = 3.2, fontface = "bold", color = "black"
+  ) +
+  coord_polar(theta = "y", clip = "off") +
+  theme(plot.margin = margin(10, 70, 10, 10))  # space for labels on the right
+
+print(p13)
+
+
+# ---- EXPORT: p11 and p12 as image files ----
+out_dir <- "C:/"
+
+ggsave(
+  filename = file.path(out_dir, "plot_11_continuous_tile_PI_fraction.png"),
+  plot = p11,
+  width = 9, height = 7, units = "in", dpi = 300, bg = "white"
+)
+
+ggsave(
+  filename = file.path(out_dir, "plot_12_tile_categorization_map.png"),
+  plot = p12,
+  width = 9, height = 7, units = "in", dpi = 300, bg = "white"
+)
+
+
+# ---- EXPORT: all ggplots to a single PDF ----
+# Choose where to save
+out_pdf <- "C:/"
+
+# List every ggplot object you created (skip the plotly one p3d)
+plots <- list(
+  p1  = if (exists("p1"))  p1  else NULL,
+  p2  = if (exists("p2"))  p2  else NULL,
+  p3  = if (exists("p3"))  p3 else NULL,
+  p5  = if (exists("p5"))  p5 else NULL,
+  p6  = if (exists("p6"))  p6 else NULL,
+  p6b = if (exists("p6b")) p6b else NULL,
+  p7  = if (exists("p7"))  p7 else NULL,
+  p8  = if (exists("p8"))  p8 else NULL,
+  p9  = if (exists("p9"))  p9 else NULL,
+  p10 = if (exists("p10")) p10 else NULL,
+  p11 = if (exists("p11")) p11 else NULL,
+  p12 = if (exists("p12")) p12 else NULL,
+  p13 = if (exists("p13")) p13 else NULL
+)
+plots <- Filter(Negate(is.null), plots)  # drop NULLs
+
+if (length(plots) == 0) stop("No ggplot objects found to export.")
+
+pdf(out_pdf, width = 9, height = 6, onefile = TRUE)
+for (nm in names(plots)) {
+  print(plots[[nm]])
+}
+dev.off()
+message("Saved multi-page PDF: ", out_pdf)
