@@ -1,0 +1,460 @@
+// QuPath 0.6.0 — Grid search (sigma, threshold) on one channel → tiles → allocate → per-tile BG → measure single color → CSV
+
+import static qupath.lib.scripting.QP.*
+import qupath.lib.objects.*
+import qupath.lib.objects.classes.PathClass
+import qupath.lib.roi.ROIs
+import qupath.lib.regions.ImagePlane
+import qupath.lib.objects.PathCellObject
+
+// -------------------- USER SETTINGS --------------------
+setImageType('FLUORESCENCE')
+setPixelSizeMicrons(0.853000, 0.853000)
+
+// Comment out if your channels are already correct
+setChannelNames(getCurrentImageData(),
+        'Propidium iodide',   // Red
+        'Calcein AM',         // Green
+        'Hoechst 33342'       // Blue
+)
+
+// Detect on this channel…
+final String CHANNEL_NAME          = 'Hoechst 33342'   // change to PI/Calcein later if needed
+// …and measure ONLY this color (choose one: "red", "green", "blue")
+final String MEASURE_COLOR         = 'blue'
+
+// Parent ROI to operate within
+final String ONLY_ANN_NAME         = 'Polygon2'
+final boolean PROCESS_ALL_ANNOTS   = true
+
+// Tiling (created once per parent and reused for each grid combo)
+final int    TILE_SIZE_PX           = 50
+final String TILE_CLASS_NAME        = 'AutoTile'
+final boolean INCLUDE_PARTIAL_TILES = true
+final String BG_NAME_SUFFIX         = '_BG'
+final String CELLS_NAME_SUFFIX      = '_CELLS' // NW UPDATE
+
+// Cell detection (Watershed) — fixed params
+final double REQ_PX    = 0.5
+final double BG_RAD    = 8.0
+final double MED_RAD   = 0.0
+final double MIN_AREA  = 7.0
+final double MAX_AREA  = 150.0
+final double CELL_EXP  = 2.0
+final boolean SMOOTH   = true
+final boolean WATERSHED_POST = true
+
+// ---- GRID (edit these) ----
+final double[] SIGMAS      = [0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0]
+final double[] THRESHOLDS  = [25, 28, 31, 34, 37, 40, 43, 46, 49, 52]
+
+// CSV output
+final String OUT_BASENAME = 'grid_cells_vs_bg_singleChannel_long_run'
+// ------------------------------------------------------
+
+
+// -------------------- helpers --------------------
+int argb(int r,int g,int b){ (0xFF<<24)|((r&0xFF)<<16)|((g&0xFF)<<8)|(b&0xFF) }
+PathClass pc(String name){ PathClass.fromString(name) }
+boolean channelExists(String name){
+    def chans = getCurrentImageData().getServer().getMetadata().getChannels()*.getName()
+    chans.any{ (it ?: "").equalsIgnoreCase(name) }
+}
+
+// Rectangle ↔ ROI overlap (for partial tiles)
+boolean rectOverlapsROI(def roi, double x, double y, double w, double h){
+    double cx = x + w/2.0, cy = y + h/2.0
+    if (roi.contains(cx, cy)) return true
+    if (roi.contains(x, y)) return true
+    if (roi.contains(x+w, y)) return true
+    if (roi.contains(x, y+h)) return true
+    if (roi.contains(x+w, y+h)) return true
+    return false
+}
+
+List<PathObject> makeTilesUnder(PathObject parentAnn, def roi, int tileSizePx, String tileClassName, boolean includePartial, String bgSuffix){
+    // Remove old tiles/BGs (snapshot first)
+    def annToRemove = new ArrayList<PathObject>()
+    for (def a : new ArrayList<PathObject>(parentAnn.getChildObjects())){
+        if (!a.isAnnotation()) continue
+        String nm = a.getName() ?: ""
+        boolean isTile = nm.startsWith("AutoTile_") || (a.getPathClass() != null && a.getPathClass().toString().equalsIgnoreCase(tileClassName))
+        boolean isBG   = nm.endsWith(bgSuffix)
+        if (isTile || isBG) annToRemove.add(a)
+    }
+    annToRemove.each { removeObjectAndDescendants(it) }
+
+    // Create new tiles
+    def tiles = new ArrayList<PathObject>()
+    double x0 = roi.getBoundsX(), y0 = roi.getBoundsY()
+    double w  = roi.getBoundsWidth(), h = roi.getBoundsHeight()
+    int idx = 1
+    for (double x = x0; x < x0 + w; x += tileSizePx){
+        for (double y = y0; y < y0 + h; y += tileSizePx){
+            boolean keep = includePartial ? rectOverlapsROI(roi, x, y, tileSizePx, tileSizePx)
+                                          : roi.contains(x + tileSizePx/2.0, y + tileSizePx/2.0)
+            if (!keep) continue
+            def tileROI = ROIs.createRectangleROI(x, y, tileSizePx, tileSizePx, ImagePlane.getDefaultPlane())
+            def tile = PathObjects.createAnnotationObject(tileROI, pc(tileClassName))
+            tile.setName(String.format("AutoTile_%05d", idx++))
+            parentAnn.addChildObject(tile)
+            tiles.add(tile)
+        }
+    }
+    fireHierarchyUpdate()
+    tiles
+}
+
+void reparentCell(PathObject cell, PathObject newParent){
+    removeObject(cell)
+    newParent.addChildObject(cell)
+}
+
+void measureSingleColorForSelected(double pxUm, String color){
+    boolean r = color.equalsIgnoreCase('red')
+    boolean g = color.equalsIgnoreCase('green')
+    boolean b = color.equalsIgnoreCase('blue')
+    runPlugin('qupath.lib.algorithms.IntensityFeaturesPlugin', [
+        'pixelSizeMicrons' : pxUm,
+        'tileSizeMicrons'  : 25.0,
+        'colorRed'         : r,
+        'colorGreen'       : g,
+        'colorBlue'        : b,
+        'doMean'           : true,
+        'doStdDev'         : false,
+        'doMinMax'         : false,
+        'doMedian'         : false,
+        'doHaralick'       : false,
+        'haralickDistance' : 1,
+        'haralickBins'     : 32
+    ])
+}
+
+String findMeanKeyForColor(PathObject anyMeasured, String color){
+    if (anyMeasured == null) return null
+    def ml = anyMeasured.getMeasurementList()
+    def names = new ArrayList(ml.getMeasurementNames())
+    String target = color.toLowerCase()
+    for (def n : names){
+        def ln = (n ?: '').toLowerCase()
+        if (ln.contains(target) && ln.contains('mean')) return n
+    }
+    return null
+}
+
+double readVal(def ml, String key){
+    if (ml == null || key == null) return Double.NaN
+    try { return (double)ml.getMeasurementValue(key) } catch(Throwable ignore){}
+    try { return (double)ml.get(key) } catch(Throwable ignore){}
+    return Double.NaN
+}
+// ----------------------------------------------------
+
+
+// -------------------- choose parents --------------------
+def parents = getAnnotationObjects().findAll{ it.hasROI() }
+if (parents.isEmpty()){
+    def s = getCurrentImageData().getServer()
+    def roi = ROIs.createRectangleROI(0, 0, s.getWidth(), s.getHeight(), ImagePlane.getDefaultPlane())
+    def full = PathObjects.createAnnotationObject(roi); full.setName('FullImage')
+    addObject(full); fireHierarchyUpdate()
+    parents = [full]
+    println "INFO: No annotations found -> created 'FullImage'."
+} else if (!PROCESS_ALL_ANNOTS) {
+    def chosen = parents.find{ (it.getName() ?: '') == ONLY_ANN_NAME }
+    if (chosen) parents = [chosen]
+    println "INFO: Using ONLY_ANN_NAME = '" + ONLY_ANN_NAME + "'."
+}
+
+// -------------------- CLEAR previous run once, then create tiles (once) --------------------
+parents.each { parentAnn ->
+    def roi = parentAnn.getROI(); if (roi == null) return
+    int nDet=0, nTiles=0, nBG=0
+
+    // remove detections whose centroid lies inside ROI
+    def dets = new ArrayList<PathObject>()
+    for (def det : new ArrayList<PathObject>(getDetectionObjects())){
+        def r = det.getROI()
+        if (r != null && roi.contains(r.getCentroidX(), r.getCentroidY())) dets.add(det)
+    }
+    if (!dets.isEmpty()){ nDet = dets.size(); removeObjects(dets, true) }
+
+    // remove tiles & BG under this parent
+    def toRemove = new ArrayList<PathObject>()
+    for (def a : new ArrayList<PathObject>(parentAnn.getChildObjects())){
+        if (!a.isAnnotation()) continue
+        String nm = a.getName() ?: ""
+        boolean isTile = nm.startsWith('AutoTile_') || (a.getPathClass() != null && a.getPathClass().toString().equalsIgnoreCase(TILE_CLASS_NAME))
+        boolean isBG   = nm.endsWith(BG_NAME_SUFFIX)
+        if (isTile || isBG){ toRemove.add(a); if (isTile) nTiles++; if (isBG) nBG++; }
+    }
+    toRemove.each { removeObjectAndDescendants(it) }
+    fireHierarchyUpdate()
+    println "INFO: Cleared ${nDet} old detections, ${nTiles} old tiles, and ${nBG} old BG masks under '" + (parentAnn.getName() ?: "") + "'."
+
+    // make tiles once & reuse for the whole grid
+    def tiles = makeTilesUnder(parentAnn, roi, TILE_SIZE_PX, TILE_CLASS_NAME, INCLUDE_PARTIAL_TILES, BG_NAME_SUFFIX)
+    println "INFO: Tiles created under '" + parentAnn.getName() + "': " + tiles.size()
+
+    // set up color class for cells (blue)
+    def clsHoe = getPathClass('Cells - Hoechst', argb(33,150,243))
+
+    // -------------------- GRID: loop over SIGMAS × THRESHOLDS --------------------
+    // Prepare CSV file once (append across combos)
+    String imageName = getProjectEntry()?.getImageName() ?: getCurrentImageData().getServer().getShortServerName()
+    String safe = imageName.replaceAll("[\\/:]", "_")
+    File out
+    if (getProject() != null){
+        def outDir = buildFilePath(PROJECT_BASE_DIR, "exports"); mkdirs(outDir)
+        out = new File(outDir, OUT_BASENAME + "_" + safe + ".csv")
+    } else {
+        out = new File(System.getProperty("user.home"), OUT_BASENAME + "_" + safe + ".csv")
+    }
+    boolean wroteHeader = out.exists()
+
+    // Add progress count:
+    int totalCombos = SIGMAS.size() * THRESHOLDS.size()
+    int comboIndex = 0
+
+    // Loop over all combinations of sigmas and thresholds
+    for (double SIGMA_VAL : SIGMAS){
+        for (double THR_VAL : THRESHOLDS){
+
+            // --- per-combo clear: remove detections & BG (keep tiles) ---
+            def dets2 = new ArrayList<PathObject>()
+            for (def det : new ArrayList<PathObject>(getDetectionObjects())){
+                def r = det.getROI()
+                if (r != null && roi.contains(r.getCentroidX(), r.getCentroidY())) dets2.add(det)
+            }
+            if (!dets2.isEmpty()) removeObjects(dets2, true)
+
+            def bgs2 = new ArrayList<PathObject>()
+            for (def t : tiles){
+                for (def kid : new ArrayList<PathObject>(t.getChildObjects())){
+                    if (kid.isAnnotation() && (kid.getName() ?: '').endsWith(BG_NAME_SUFFIX)) bgs2.add(kid)
+                }
+            }
+            bgs2.each { removeObjectAndDescendants(it) }
+            fireHierarchyUpdate()
+
+            // --- detection under parent with current (sigma, threshold) ---
+            if (!channelExists(CHANNEL_NAME))
+                println "WARN: Channel '" + CHANNEL_NAME + "' not found; detection may return 0."
+
+            resetSelection(); selectObjects(parentAnn)
+            runPlugin('qupath.imagej.detect.cells.WatershedCellDetection', [
+                'detectionImage'            : CHANNEL_NAME,
+                'requestedPixelSizeMicrons' : REQ_PX,
+                'backgroundRadiusMicrons'   : BG_RAD,
+                'medianRadiusMicrons'       : MED_RAD,
+                'sigmaMicrons'              : SIGMA_VAL,
+                'minAreaMicrons'            : MIN_AREA,
+                'maxAreaMicrons'            : MAX_AREA,
+                'threshold'                 : THR_VAL,
+                'watershedPostProcess'      : WATERSHED_POST,
+                'cellExpansionMicrons'      : CELL_EXP,
+                'includeNuclei'             : true,
+                'smoothBoundaries'          : SMOOTH,
+                'makeMeasurements'          : true
+            ])
+
+            // set class/color on new cells (snapshot)
+            int nCells = 0
+            def newCells = new ArrayList<PathObject>()
+            for (def child : new ArrayList<PathObject>(parentAnn.getChildObjects())){
+                if (child instanceof PathCellObject){
+                    child.setPathClass(clsHoe)
+                    child.setColor(null)
+                    newCells.add(child)
+                    nCells++
+                }
+            }
+            fireHierarchyUpdate()
+            println String.format("INFO: %s -> Detected cells: %d (sigma=%.2f, thr=%.2f)",
+                                  parentAnn.getName(), nCells, SIGMA_VAL, THR_VAL)
+
+            // allocate cells to tiles (nearest if on borders/outside)
+            if (!newCells.isEmpty()){
+                def tileCenters = tiles.collect { t -> def tr = t.getROI(); [tile:t, cx:tr.getCentroidX(), cy:tr.getCentroidY()] }
+                int moved = 0
+                for (def cell : newCells){
+                    def r = cell.getROI(); double cx = r.getCentroidX(), cy = r.getCentroidY()
+                    PathObject owner = null
+                    for (def t : tiles){ if (t.getROI().contains(cx, cy)){ owner = t; break } }
+                    if (owner == null){
+                        double bestD2 = Double.POSITIVE_INFINITY
+                        PathObject best = null
+                        for (def tc : tileCenters){
+                            double dx = cx - tc.cx, dy = cy - tc.cy
+                            double d2 = dx*dx + dy*dy
+                            if (d2 < bestD2){ bestD2 = d2; best = tc.tile }
+                        }
+                        owner = best
+                    }
+                    if (owner != null){ reparentCell(cell, owner); moved++ }
+                }
+                fireHierarchyUpdate()
+                println "INFO: Allocated: " + moved + " / " + newCells.size()
+            }
+
+
+
+            // *********************************** NW UPDATE START *********************************
+            // Build per-tile ROIs: Cell-union and Background masks
+                // Creates two annotation ROIs per tile — one for the union of all detected cells (_CELLS) and one for the background region (_BG = tile − cells).
+                // These will later be used for single-color intensity measurement.
+
+            // BG and CELLS masks per tile (BG = tile − union(cells); CELLS = union(cells))
+            int bgMade = 0, bgEmpty = 0, cellsMade = 0
+            for (def tile : tiles){
+                def tileROI = tile.getROI(); if (tileROI == null) continue
+
+                // collect cell ROIs for this tile
+                def cellROIs = new ArrayList()
+                def cellKids = new ArrayList<PathObject>(tile.getChildObjects())
+                for (def ch : cellKids){
+                    if (ch instanceof PathCellObject && ch.getROI() != null)
+                        cellROIs.add(ch.getROI())
+                }
+
+                // union of cells (may be null if none)
+                def cellsUnionROI = null
+                if (!cellROIs.isEmpty()){
+                    cellsUnionROI = cellROIs[0]
+                    for (int i = 1; i < cellROIs.size(); i++)
+                        cellsUnionROI = qupath.lib.roi.RoiTools.combineROIs(cellsUnionROI, cellROIs[i], qupath.lib.roi.RoiTools.CombineOp.ADD)
+                }
+
+                // BG = tile − union(cells)
+                def bgROI = tileROI
+                if (cellsUnionROI != null)
+                    bgROI = qupath.lib.roi.RoiTools.combineROIs(tileROI, cellsUnionROI, qupath.lib.roi.RoiTools.CombineOp.SUBTRACT)
+
+                // Create a BG annotation object if not null and update count
+                if (bgROI != null){
+                    def bg = PathObjects.createAnnotationObject(bgROI, pc('Background'))
+                    bg.setName(tile.getName() + BG_NAME_SUFFIX)
+                    tile.addChildObject(bg)
+                    bgMade++
+                } else {
+                    bgEmpty++
+                }
+
+                 // Create a CELLS annotation only if we have cells and update count
+                if (cellsUnionROI != null){
+                    def cellsAnnot = PathObjects.createAnnotationObject(cellsUnionROI, pc('CellsUnion'))
+                    cellsAnnot.setName(tile.getName() + CELLS_NAME_SUFFIX)
+                    tile.addChildObject(cellsAnnot)
+                    cellsMade++
+                }
+            }
+            fireHierarchyUpdate()
+            println "INFO: BG masks: ${bgMade} (empty skipped: ${bgEmpty}); Cells unions: ${cellsMade}"
+
+            // *********************************** NW UPDATE END *********************************
+
+
+
+            // *********************************** NW UPDATE START *********************************
+            // Measure intensity for Cells-union and Background ROIs
+                // Selects all _CELLS and _BG annotations across all tiles and runs your single-color intensity measurement plugin once per tile pair, recording mean pixel intensities.
+            
+            // Measure only selected color on current iteration's BG + CELLS (per tile)
+            def allBG = new ArrayList<PathObject>()
+            def allCellsUnions = new ArrayList<PathObject>()
+            def nCellsPerTile = [:].withDefault{ 0 }
+
+            for (def t : tiles){
+                def kids = new ArrayList<PathObject>(t.getChildObjects())
+                int nCellsHere = 0
+                for (def ch : kids){
+                    if (ch instanceof PathCellObject) nCellsHere++
+                    def nm = (ch.getName() ?: '')
+                    if (ch.isAnnotation() && nm.endsWith(BG_NAME_SUFFIX)) allBG.add(ch)
+                    if (ch.isAnnotation() && nm.endsWith(CELLS_NAME_SUFFIX)) allCellsUnions.add(ch)
+                }
+                nCellsPerTile[t.getName() ?: ''] = nCellsHere
+            }
+
+
+            def toMeasure = new ArrayList<PathObject>()
+            toMeasure.addAll(allBG)
+            toMeasure.addAll(allCellsUnions)
+
+            if (!toMeasure.isEmpty()){
+                resetSelection()
+                selectObjects(toMeasure)
+                measureSingleColorForSelected(REQ_PX, MEASURE_COLOR)
+            }
+
+            // *********************************** NW UPDATE END *********************************
+
+
+
+
+            // *********************************** NW UPDATE START *********************************
+            // Write one CSV row per tile (Cells mean, BG mean)
+                // Extracts the measured mean values for each tile’s cell-union and background, counts the number of detected cells per tile, and writes one summarized row per tile to the CSV.
+           
+            // find measurement key (probe any measured object)
+            def probe = !allCellsUnions.isEmpty() ? allCellsUnions[0] : (!allBG.isEmpty() ? allBG[0] : null)
+            String keyMean = findMeanKeyForColor(probe, MEASURE_COLOR)
+            if (keyMean == null){
+                println "WARN: No measurement key found for color '${MEASURE_COLOR}' (sigma=${SIGMA_VAL}, thr=${THR_VAL})."
+                continue
+            }
+
+            // open CSV (append)
+            boolean needHeader = !wroteHeader
+            def pw = new PrintWriter(new FileOutputStream(out, true))
+            if (needHeader){
+                // one row per tile
+                pw.println("image,parent_roi,tile,channel,threshold,sigma,n_cells_in_tile,cells_mean,bg_mean,color")
+                wroteHeader = true
+            }
+
+            // build maps: tile -> bg mean, tile -> cells mean
+            def bgMeanByTile    = [:]
+            def cellsMeanByTile = [:]
+
+            for (def bg : allBG){
+                def ml = bg.getMeasurementList()
+                double bv = readVal(ml, keyMean)
+                String tileName = (bg.getName() ?: '').replace(BG_NAME_SUFFIX, '')
+                bgMeanByTile[tileName] = bv
+            }
+            for (def cu : allCellsUnions){
+                def ml = cu.getMeasurementList()
+                double cv = readVal(ml, keyMean)
+                String tileName = (cu.getName() ?: '').replace(CELLS_NAME_SUFFIX, '')
+                cellsMeanByTile[tileName] = cv
+            }
+
+            // write exactly one row per tile
+            for (def t : tiles){
+                String tileName = t.getName() ?: ''
+                int nHere = nCellsPerTile[tileName]
+                double cellsMean = cellsMeanByTile.containsKey(tileName) ? (double)cellsMeanByTile[tileName] : Double.NaN
+                double bgMean    = bgMeanByTile.containsKey(tileName)    ? (double)bgMeanByTile[tileName]    : Double.NaN
+                pw.println([safe, parentAnn.getName() ?: '', tileName, CHANNEL_NAME, THR_VAL, SIGMA_VAL, nHere, cellsMean, bgMean, MEASURE_COLOR].join(","))
+            }
+
+            pw.flush(); pw.close()
+
+            comboIndex++
+            // compute simple summary stats for console output
+            double meanCellsAcrossTiles = cellsMeanByTile.values().stream().mapToDouble(Double::doubleValue).average().orElse(Double.NaN)
+            double meanBgAcrossTiles    = bgMeanByTile.values().stream().mapToDouble(Double::doubleValue).average().orElse(Double.NaN)
+
+            // progress + summary line
+            println String.format(
+                "INFO: [%d/%d] sigma=%.2f, thr=%.2f -> %s | mean(cells)=%.3f, mean(bg)=%.3f",
+                comboIndex, totalCombos, SIGMA_VAL, THR_VAL, out.getAbsolutePath(),
+                meanCellsAcrossTiles, meanBgAcrossTiles
+            )
+        } // THRESHOLDS
+    } // SIGMAS
+
+} // parents
+
+println "DONE."
