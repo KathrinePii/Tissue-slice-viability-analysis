@@ -1,0 +1,1098 @@
+import static qupath.lib.scripting.QP.*
+import qupath.lib.objects.PathObjects
+import qupath.lib.roi.ROIs
+import qupath.lib.regions.ImagePlane
+import qupath.lib.roi.RoiTools
+import java.nio.charset.StandardCharsets
+import java.io.*
+
+// ================== USER SETTINGS ==================
+
+setImageType('FLUORESCENCE')
+setPixelSizeMicrons(0.853000, 0.853000)
+
+setChannelNames(getCurrentImageData(),
+        'Propidium iodide',   // Red
+        'Calcein AM',         // Green
+        'Hoechst 33342'       // Blue
+)
+
+// Channel names
+final String CH_PI   = 'Propidium iodide'   // PI -> R
+final String CH_CAL  = 'Calcein AM'         // Calcein -> G
+final String CH_HOE  = 'Hoechst 33342'      // Hoechst -> B
+
+// Detection parameters
+final double REQ_PX    = 0.5
+final double BG_RAD    = 8.0
+final double MED_RAD   = 0.0
+final double SIGMA     = 0.3
+final double MIN_AREA  = 7.0
+final double MAX_AREA  = 150.0
+final double CELL_EXP  = 1.0
+
+// Per-channel thresholds
+double THR_HOE = 33.0
+double THR_PI  = 33.0
+double THR_CAL = 33.0
+
+// Scope
+boolean PROCESS_ALL_ANNOTATIONS   = false
+String  ONLY_ANN_NAME             = "Tissue"
+
+// Behavior
+boolean CLEAR_PREVIOUS_RUN                = true
+boolean ALSO_CLEAR_BASE_DETECTIONS        = false
+boolean REPLACE_EXISTING_CLONES           = true
+boolean CLEAR_DETECTIONS_IN_EACH_CLONE    = true
+
+// Triple-overlap settings (visualize on Hoechst)
+double  TRIPLE_MAXFRAC_SINGLE_THRESHOLD = 0.80
+double ERODE_CAL_BEFORE_TRIPLE = 2.0
+double ERODE_PI_BEFORE_TRIPLE  = 0.0
+double H_DILATE_FOR_TRIPLE     = 3.0
+double MIN_H_PI_FRAC           = 0.10
+double MIN_H_CAL_FRAC          = 0.10
+double MAX_CENTROID_DIST       = 0.0
+boolean COLORIZE_HOECHST_BY_TRIPLE_CLASS = true
+boolean CHANGE_CLASS_INSTEAD_OF_COLOR    = false
+
+// Colors (ARGB)
+final int COLOR_PI       = ((255&0xFF)<<24)|((244&0xFF)<<16)|(( 67&0xFF)<<8)|( 54&0xFF)
+final int COLOR_CAL      = ((255&0xFF)<<24)|(( 76&0xFF)<<16)|((175&0xFF)<<8)|( 80&0xFF)
+final int COLOR_H_NONE   = ((255&0xFF)<<24)|((158&0xFF)<<16)|((158&0xFF)<<8)|(158&0xFF)
+final int COLOR_H_SINGLE = ((255&0xFF)<<24)|((255&0xFF)<<16)|((235&0xFF)<<8)|( 59&0xFF)
+final int COLOR_H_SEVERAL= ((255&0xFF)<<24)|((255&0xFF)<<16)|((255&0xFF)<<8)|(255&0xFF)
+
+// Classes
+def clsTripleSingle  = getPathClass('Triple - Single',  COLOR_H_SINGLE)
+def clsTripleSeveral = getPathClass('Triple - Several', COLOR_H_SEVERAL)
+def clsTripleNone    = getPathClass('Triple - None',    COLOR_H_NONE)
+
+def clsHoe = getPathClass('Cells - Hoechst',  (0xFF<<24)| (33<<16)| (150<<8)| 243 )
+def clsPI  = getPathClass('Cells - PI',       COLOR_PI)
+def clsCal = getPathClass('Cells - Calcein',  COLOR_CAL)
+
+// ===== Intensity measurement strategy =====
+final String REGION_FOR_INTENSITY = "Nucleus"  // or "Cell"
+final String KEY_R = "RGB_R_PI"    // lives on PI detections
+final String KEY_G = "RGB_G_CAL"   // lives on Calcein detections
+final String KEY_B = "RGB_B_HOE"   // lives on Hoechst detections
+
+// ===== Tiles settings =====
+double TILE_SIZE_UM    = 50.0
+int    MIN_PER_CHANNEL = 3   // will be normalized by tile area below
+
+// ===== Absolute classification cutoffs for PI fraction =====
+double PI_FRAC_ALIVE_MAX = 0.30    // Alive if PI fraction < 0.30
+double PI_FRAC_DEAD_MIN  = 0.70    // Dead  if PI fraction ≥ 0.70
+// ================================================================
+
+// ---------- helpers ----------
+def argb = { int r,int g,int b -> (0xFF<<24)|((r&0xFF)<<16)|((g&0xFF)<<8)|(b&0xFF) }
+
+def makeCsvWriter = { File outFile ->
+    def fos = new FileOutputStream(outFile)
+    def osw = new OutputStreamWriter(fos, StandardCharsets.UTF_8)
+    def pw  = new PrintWriter(osw)
+    pw.write('\ufeff') // UTF-8 BOM
+    return pw
+}
+
+def createOrReplaceClone = { baseAnn, String suffix ->
+    String newName = baseAnn.getName() + " — " + suffix
+    if (REPLACE_EXISTING_CLONES) {
+        def old = getAnnotationObjects().find { (it.getName() ?: "") == newName }
+        if (old) removeObjectAndDescendants(old)
+    }
+    def clone = PathObjects.createAnnotationObject(baseAnn.getROI(), baseAnn.getPathClass())
+    clone.setName(newName)
+    addObject(clone)
+    clone
+}
+def clearDetectionsUnder = { ann ->
+    def kids = getDetectionObjects().findAll { it.getParent() == ann }
+    if (!kids.isEmpty()) { removeObjects(kids); fireHierarchyUpdate() }
+}
+def channelExists = { String name ->
+    def chans = getCurrentImageData().getServer().getMetadata().getChannels()*.getName()
+    chans.any{ (it ?: "").equalsIgnoreCase(name) }
+}
+def runWatershedIntoClone = { cloneAnn, String channel, double thr, targetClass, String tag ->
+    if (!channelExists(channel)) { println "WARN: Channel '" + channel + "' not found. Skipping " + tag + "."; return 0 }
+    if (CLEAR_DETECTIONS_IN_EACH_CLONE) clearDetectionsUnder(cloneAnn)
+    resetSelection(); selectObjects(cloneAnn)
+    String json =
+        '{' +
+        '"detectionImage":"' + channel + '",' +
+        '"requestedPixelSizeMicrons":' + REQ_PX + ',' +
+        '"backgroundRadiusMicrons":'    + BG_RAD + ',' +
+        '"backgroundByReconstruction":true,' +
+        '"medianRadiusMicrons":'         + MED_RAD + ',' +
+        '"sigmaMicrons":'                + SIGMA + ',' +
+        '"minAreaMicrons":'              + MIN_AREA + ',' +
+        '"maxAreaMicrons":'              + MAX_AREA + ',' +
+        '"threshold":'                   + thr + ',' +
+        '"watershedPostProcess":true,' +
+        '"cellExpansionMicrons":'        + CELL_EXP + ',' +
+        '"includeNuclei":true,' +
+        '"smoothBoundaries":true,' +
+        '"makeMeasurements":true' +
+        '}'
+    try {
+        runPlugin('qupath.imagej.detect.cells.WatershedCellDetection', json)
+    } catch (Throwable t1) {
+        try { runPlugin('qupath.imagej.detect.nuclei.WatershedCellDetection', json) }
+        catch (Throwable t2) { println "ERROR: Could not run WatershedCellDetection for '" + channel + "'."; return 0 }
+    }
+    int nTagged = 0
+    getDetectionObjects().each { d ->
+        if (d.getParent() == cloneAnn) { d.setPathClass(targetClass); d.setColor(null); nTagged++ }
+    }
+    fireHierarchyUpdate()
+    println "Cell detection (" + tag + ") -> clone '" + cloneAnn.getName() + "': tagged=" + nTagged + "."
+    nTagged
+}
+def areaOf = { roi -> (roi == null) ? 0.0 : roi.getArea() }
+def expandSafe = { roi, double amount ->
+    if (roi == null || amount == 0.0) return roi
+    try { return RoiTools.expand(roi, amount) } catch (Throwable t) { return roi }
+}
+def findClone = { baseAnn, String suffix ->
+    def expect = [ baseAnn.getName() + " — " + suffix, baseAnn.getName() + " - "  + suffix ] as Set
+    getAnnotationObjects().find { a -> expect.contains(a.getName() ?: "") }
+}
+def mval = { ml, String key ->
+    try {
+        def v = ml?.get(key)
+        return (v instanceof Number) ? (v as double) : Double.NaN
+    } catch (Throwable t) {
+        return Double.NaN
+    }
+}
+def zFromROI = { roi -> try { def z = roi == null ? null : roi.getZ(); return z == null ? null : (z as double) } catch (Throwable t) { return null } }
+def centroidZSafe = { roi -> def z = zFromROI(roi); return z == null ? "" : ("" + z) }
+def getBases = { boolean processAll, String onlyName ->
+    def bases = getAnnotationObjects().findAll { it.hasROI() }
+    if (!processAll) { def a = bases.find { it.getName() == onlyName }; if (a != null) bases = [a] }
+    bases
+}
+
+// ---------- CLEAR PREVIOUS RUN ----------
+def clearPreviousRun = { boolean processAll, String onlyName, boolean alsoClearBase ->
+    def suffixes = ['Hoechst','PI','Calcein']
+    int removedClones = 0, removedPoints = 0, removedBaseDet = 0
+    def bases = getBases(processAll, onlyName)
+    bases.each { base ->
+        def cloneNames = suffixes.collectMany { suf -> [ base.getName() + " — " + suf, base.getName() + " - " + suf ] }
+        def clones = getAnnotationObjects().findAll { cloneNames.contains(it.getName() ?: "") }
+        if (!clones.isEmpty()) { clones.each { removeObjectAndDescendants(it) }; removedClones += clones.size() }
+        def points = getAnnotationObjects().findAll { obj ->
+            def nm = (obj.getName() ?: "")
+            nm.startsWith("H ") || nm.startsWith("P ") || nm.startsWith("C ") || nm.startsWith("Triple ")
+        }
+        if (!points.isEmpty()) { removeObjects(points); removedPoints += points.size() }
+        if (alsoClearBase) {
+            def baseDets = getDetectionObjects().findAll { it.getParent() == base }
+            if (!baseDets.isEmpty()) { removeObjects(baseDets); removedBaseDet += baseDets.size() }
+        }
+        try {
+            def ml = base.getMeasurementList()
+            ['Triple overlap - Hoechst cells (n)','Triple overlap - Single cell count','Triple overlap - Several cell count',
+             'Triple overlap - No triple count','Triple overlap - Single cell %','Triple overlap - Several cell %'].each { k -> ml.remove(k) }
+        } catch (Throwable ignore) {}
+        def oldTiles = getAnnotationObjects().findAll { (it.getName() ?: "").startsWith(base.getName() + " — Tile") }
+        if (!oldTiles.isEmpty()) removeObjects(oldTiles)
+    }
+    fireHierarchyUpdate()
+    println "INFO: CLEANUP: removed clones=" + removedClones + ", points=" + removedPoints + ", baseDetections=" + removedBaseDet + "."
+}
+if (CLEAR_PREVIOUS_RUN) clearPreviousRun(PROCESS_ALL_ANNOTATIONS, ONLY_ANN_NAME, ALSO_CLEAR_BASE_DETECTIONS)
+
+// ---------- Intensity plugin for per-cell stamping ----------
+def runIntensityPluginPortable = { String channelName ->
+    def candidates = [
+        'qupath.lib.plugins.objects.IntensityFeaturesPlugin',
+        'qupath.lib.plugins.IntensityFeaturesPlugin',
+        'qupath.lib.algorithms.IntensityFeaturesPlugin'
+    ]
+
+    def base = '"pixelSizeMicrons":' + REQ_PX + ',' +
+               '"region":"' + REGION_FOR_INTENSITY + '",' +
+               '"tileSizeMicrons":25.0,' +
+               '"doMean":true,"doMinMax":false,"doStdDev":false,"doMedian":false'
+
+    def payloadsFor = { ch ->
+        [
+            '{' + base + ',"channels":"' + ch + '"}',
+            '{' + base + ',"channel":"'  + ch + '"}',
+            '{' + base + ',"channels":[{"channel":"' + ch + '","normalize":false}]}'
+        ]
+    }
+
+    for (cid in candidates) {
+        boolean exists = false
+        try { Class.forName(cid); exists = true } catch (Throwable ignore) {}
+        if (!exists) continue
+        for (payload in payloadsFor(channelName)) {
+            try {
+                runPlugin(cid, payload)
+                println "INFO: Ran intensity plugin '" + cid + "' with payload shape OK"
+                return true
+            } catch (Throwable t) { /* try next */ }
+        }
+    }
+    println "ERROR: No compatible IntensityFeaturesPlugin payload worked for channel '" + channelName + "'."
+    return false
+}
+
+// --- BG measurer (RGB-style; region=ROI) ---
+def measureBGMeansRGB_on = { List anns ->
+    if (anns == null || anns.isEmpty()) return
+    resetSelection(); selectObjects(anns)
+    String json = """{
+      "pixelSizeMicrons": ${REQ_PX},
+      "tileSizeMicrons" : 25.0,
+      "region"          : "ROI",
+      "colorRed"        : true,
+      "colorGreen"      : true,
+      "colorBlue"       : true,
+      "doMean"          : true,
+      "doStdDev"        : false,
+      "doMinMax"        : false,
+      "doMedian"        : false,
+      "doHaralick"      : false,
+      "haralickDistance": 1,
+      "haralickBins"    : 32
+    }"""
+    boolean ok = false
+    try { runPlugin('qupath.lib.algorithms.IntensityFeaturesPlugin', json); ok = true }
+    catch (Throwable t1) {
+        try { runPlugin('qupath.imagej.analyze.IntensityFeaturesPlugin', json); ok = true }
+        catch (Throwable t2) { println "ERROR: Could not run RGB IntensityFeaturesPlugin for BG means." }
+    }
+    if (ok) println "INFO: BG means measured via RGB IntensityFeaturesPlugin."
+}
+def pickMean = { ml, String colorWord ->
+    def names = ml?.getMeasurementNames()
+    if (names == null) return Double.NaN
+    def key = names.find { k ->
+        def s = (k ?: "").toLowerCase()
+        s.contains('mean') && (s.contains(colorWord))
+    }
+    return (key && (ml.get(key) instanceof Number)) ? (ml.get(key) as double) : Double.NaN
+}
+
+// ---------- Measure & stamp helper (per-cell) ----------
+def measureAndStamp = { ann, String channelName, String outKey ->
+    if (ann == null) return 0
+    def dets = getDetectionObjects().findAll { it.getParent() == ann }
+    if (dets.isEmpty()) { println "WARN: No detections under '${ann?.getName()}' to measure."; return 0 }
+
+    resetSelection(); selectObjects(dets)
+
+    boolean ok = runIntensityPluginPortable(channelName)
+    if (!ok) {
+        dets.each { d -> d.getMeasurementList().put(outKey, Double.NaN) }
+        println "WARN: Stamped NaN for '${outKey}' because intensity plugin didn’t accept any payload."
+        return dets.size()
+    }
+
+    int stamped = 0
+    dets.each { d ->
+        def ml = d.getMeasurementList()
+        def key = ml.getMeasurementNames()?.find { k ->
+            def s = (k?:'').toLowerCase()
+            s.contains(channelName.toLowerCase()) && (s.contains(' mean') || s.startsWith('mean') || s.contains('avg'))
+        }
+        double val = (key ? ((ml.get(key) instanceof Number) ? (ml.get(key) as double) : Double.NaN) : Double.NaN)
+        ml.put(outKey, val)
+        stamped++
+    }
+    println "INFO: Stamped '${outKey}' on ${stamped} detections under '${ann.getName()}' (region=${REGION_FOR_INTENSITY})."
+    return stamped
+}
+
+// ---------- choose base annotations (or create FullImage fallback) ----------
+def anns = getAnnotationObjects().findAll{ it.hasROI() }
+if (anns.isEmpty()){
+    def s = getCurrentImageData().getServer()
+    def roi = ROIs.createRectangleROI(0, 0, s.getWidth(), s.getHeight(), ImagePlane.getDefaultPlane())
+    def full = PathObjects.createAnnotationObject(roi)
+    full.setName('FullImage'); addObject(full); anns = [full]
+    println "INFO: No annotations found -> created 'FullImage'."
+} else if (!PROCESS_ALL_ANNOTATIONS){
+    def a = anns.find{ it.getName() == ONLY_ANN_NAME }
+    if (!a){ println "ERROR: Annotation '" + ONLY_ANN_NAME + "' not found."; return }
+    anns = [a]
+}
+
+// ---------- run per base annotation: detect & measure per-channel ----------
+anns.each { baseAnn ->
+    def annHoe = createOrReplaceClone(baseAnn, "Hoechst")
+    def annPI  = createOrReplaceClone(baseAnn, "PI")
+    def annCal = createOrReplaceClone(baseAnn, "Calcein")
+
+    int nHoe = runWatershedIntoClone(annHoe, CH_HOE, THR_HOE, clsHoe, "Hoechst")
+    int nPI  = runWatershedIntoClone(annPI,  CH_PI,  THR_PI,  clsPI,  "PI")
+    int nCal = runWatershedIntoClone(annCal, CH_CAL, THR_CAL, clsCal, "Calcein")
+
+    measureAndStamp(annHoe, CH_HOE, KEY_B)
+    measureAndStamp(annPI,  CH_PI,  KEY_R)
+    measureAndStamp(annCal, CH_CAL, KEY_G)
+
+    println String.format("INFO: SUMMARY '%s' -> Hoechst=%d, PI=%d, Calcein=%d", baseAnn.getName(), nHoe, nPI, nCal)
+}
+println("INFO: Detection + per-channel intensity stamping complete.")
+
+// ====== Triple-overlap analysis (colorize Hoechst) ======
+def computeTripleOverlap = { boolean processAll, String onlyName ->
+    def safeId = { obj ->
+        try { return obj?.getID() } catch (Throwable t) {}
+        try {
+            def r = obj?.getROI()
+            return r ? ("cx="+Math.rint(r.getCentroidX())+",cy="+Math.rint(r.getCentroidY())) : ("obj@"+System.identityHashCode(obj))
+        } catch (Throwable t2) { return ("obj@"+System.identityHashCode(obj)) }
+    }
+
+    def bases = getBases(processAll, onlyName)
+    bases.each { baseAnn ->
+        def annH = findClone(baseAnn, 'Hoechst')
+        def annP = findClone(baseAnn, 'PI')
+        def annC = findClone(baseAnn, 'Calcein')
+        if (!annH || !annP || !annC) { println "WARN: Missing clones under '${baseAnn.getName()}'. Skipping triple."; return }
+
+        def hCells = getDetectionObjects().findAll { it.getParent() == annH && it.hasROI() }
+        def pCells = getDetectionObjects().findAll { it.getParent() == annP && it.hasROI() }
+        def cCells = getDetectionObjects().findAll { it.getParent() == annC && it.hasROI() }
+
+        int singleCount = 0, multiCount = 0, noTripleCount = 0
+
+        hCells.each { h ->
+            def hROI = h.getROI()
+            double aH = areaOf(hROI)
+
+            // candidates with any intersection
+            def pCands0 = pCells.findAll { p -> areaOf(RoiTools.combineROIs(hROI, p.getROI(), RoiTools.CombineOp.INTERSECT)) > 0.0 }
+            def cCands0 = cCells.findAll { c -> areaOf(RoiTools.combineROIs(hROI, c.getROI(), RoiTools.CombineOp.INTERSECT)) > 0.0 }
+
+            def hDil = (H_DILATE_FOR_TRIPLE != 0.0) ? expandSafe(hROI, H_DILATE_FOR_TRIPLE) : hROI
+
+            // filter partners by min H overlap fraction
+            def piPartners  = [] as Set
+            def calPartners = [] as Set
+
+            pCands0.each { p ->
+                def pUse  = expandSafe(p.getROI(), -ERODE_PI_BEFORE_TRIPLE)
+                def pNear = (hDil != null && pUse != null) ? RoiTools.combineROIs(pUse, hDil, RoiTools.CombineOp.INTERSECT) : pUse
+                if (pNear != null) {
+                    if (MIN_H_PI_FRAC > 0.0 && aH > 0) {
+                        def h_pi = RoiTools.combineROIs(hROI, pNear, RoiTools.CombineOp.INTERSECT)
+                        if (areaOf(h_pi)/aH >= MIN_H_PI_FRAC) piPartners << p
+                    } else {
+                        piPartners << p
+                    }
+                }
+            }
+            cCands0.each { c ->
+                def cUse  = expandSafe(c.getROI(), -ERODE_CAL_BEFORE_TRIPLE)
+                def cNear = (hDil != null && cUse != null) ? RoiTools.combineROIs(cUse, hDil, RoiTools.CombineOp.INTERSECT) : cUse
+                if (cNear != null) {
+                    if (MIN_H_CAL_FRAC > 0.0 && aH > 0) {
+                        def h_cal = RoiTools.combineROIs(hROI, cNear, RoiTools.CombineOp.INTERSECT)
+                        if (areaOf(h_cal)/aH >= MIN_H_CAL_FRAC) calPartners << c
+                    } else {
+                        calPartners << c
+                    }
+                }
+            }
+
+            // triple pairs & best max fraction (for coloring/class)
+            double bestMaxFrac = Double.NaN
+            int triplePairs = 0
+
+            if (!piPartners.isEmpty() && !calPartners.isEmpty()) {
+                piPartners.each { p ->
+                    def pUse  = expandSafe(p.getROI(), -ERODE_PI_BEFORE_TRIPLE)
+                    def pNear = (hDil != null && pUse != null) ? RoiTools.combineROIs(pUse, hDil, RoiTools.CombineOp.INTERSECT) : pUse
+                    double aP = areaOf(pUse)
+                    calPartners.each { c ->
+                        def cUse  = expandSafe(c.getROI(), -ERODE_CAL_BEFORE_TRIPLE)
+                        def cNear = (hDil != null && cUse != null) ? RoiTools.combineROIs(cUse, hDil, RoiTools.CombineOp.INTERSECT) : cUse
+                        double aC = areaOf(cUse)
+                        if (pNear == null || cNear == null) return
+                        def interPC = RoiTools.combineROIs(pNear, cNear, RoiTools.CombineOp.INTERSECT)
+                        if (areaOf(interPC) <= 0) return
+
+                        def interAll = RoiTools.combineROIs(RoiTools.combineROIs(hROI, pNear, RoiTools.CombineOp.INTERSECT), cNear, RoiTools.CombineOp.INTERSECT)
+                        double aI = areaOf(interAll)
+                        if (aI <= 0) return
+
+                        triplePairs++
+                        double fH = (aH > 0) ? (aI / aH) : Double.NaN
+                        double fP = (aP > 0) ? (aI / aP) : Double.NaN
+                        double fC = (aC > 0) ? (aI / aC) : Double.NaN
+                        double maxFrac = Math.max((Double.isNaN(fH)?0.0:fH), Math.max((Double.isNaN(fP)?0.0:fP), (Double.isNaN(fC)?0.0:fC)))
+                        if (Double.isNaN(bestMaxFrac) || maxFrac > bestMaxFrac) bestMaxFrac = maxFrac
+                    }
+                }
+            }
+
+            boolean hasAnyTriple = (triplePairs > 0) || !Double.isNaN(bestMaxFrac)
+            boolean isSingle     = hasAnyTriple && (bestMaxFrac >= TRIPLE_MAXFRAC_SINGLE_THRESHOLD)
+
+            if (COLORIZE_HOECHST_BY_TRIPLE_CLASS) {
+                h.setColor(!hasAnyTriple ? COLOR_H_NONE : (isSingle ? COLOR_H_SINGLE : COLOR_H_SEVERAL))
+            }
+            if (CHANGE_CLASS_INSTEAD_OF_COLOR) {
+                h.setPathClass(!hasAnyTriple ? clsTripleNone : (isSingle ? clsTripleSingle : clsTripleSeveral))
+            }
+
+            // stamp measurements
+            def ml = h.getMeasurementList()
+            ml.put('Triple overlap max frac (max)',   hasAnyTriple ? bestMaxFrac : Double.NaN)
+            ml.put('Triple overlap class',            hasAnyTriple ? (isSingle ? 1.0 : 2.0) : 0.0)
+
+            def piIDs  = piPartners.collect { safeId(it) } as List
+            def calIDs = calPartners.collect { safeId(it) } as List
+            ml.put('H partners PI (n)',  (double)piIDs.size())
+            ml.put('H partners CAL (n)', (double)calIDs.size())
+            ml.put('H triple pairs (n)', (double)triplePairs)
+            try { ml.put('H partners PI ids',  piIDs.join(';')) } catch (Throwable ignore) {}
+            try { ml.put('H partners CAL ids', calIDs.join(';')) } catch (Throwable ignore) {}
+
+            if (!hasAnyTriple)       noTripleCount++
+            else if (isSingle)       singleCount++
+            else                     multiCount++
+        }
+
+        def mlb = baseAnn.getMeasurementList()
+        int n = getDetectionObjects().count { it.getParent() == findClone(baseAnn,'Hoechst') && it.hasROI() }
+        mlb.put('Triple overlap - Hoechst cells (n)', (double)n)
+        mlb.put('Triple overlap - Single cell count', (double)singleCount)
+        mlb.put('Triple overlap - Several cell count', (double)multiCount)
+        mlb.put('Triple overlap - No triple count', (double)noTripleCount)
+        mlb.put('Triple overlap - Single cell %', n>0 ? 100.0*singleCount/n : Double.NaN)
+        mlb.put('Triple overlap - Several cell %', n>0 ? 100.0*multiCount/n : Double.NaN)
+
+        println String.format(
+            "INFO: Triple '%s': single=%d (%.1f%%), several=%d (%.1f%%), none=%d (n=%d)",
+            baseAnn.getName(),
+            singleCount, (n > 0 ? 100.0*singleCount/n : Double.NaN),
+            multiCount,  (n > 0 ? 100.0*multiCount/n  : Double.NaN),
+            noTripleCount, n
+        )
+    }
+    fireHierarchyUpdate()
+}
+computeTripleOverlap(PROCESS_ALL_ANNOTATIONS, ONLY_ANN_NAME)
+
+// ====== TILES — create, count, filter (area-normalized), unions, BG means & intensity ratios ======
+def createTilesAndFilter = { baseAnn ->
+    def imgData = getCurrentImageData()
+    def server  = imgData.getServer()
+    def cal     = server.getPixelCalibration()
+    double umPerPx = (cal == null) ? 1.0 : cal.getAveragedPixelSizeMicrons()
+    double tileWpx = Math.max(1.0, TILE_SIZE_UM / umPerPx)
+    double tileHpx = Math.max(1.0, TILE_SIZE_UM / umPerPx)
+    double fullTileAreaUm2 = TILE_SIZE_UM * TILE_SIZE_UM
+
+    def bROI = baseAnn.getROI()
+    double bx = bROI.getBoundsX(), by = bROI.getBoundsY()
+    double bw = bROI.getBoundsWidth(), bh = bROI.getBoundsHeight()
+
+    double x0 = Math.max(0, Math.floor(bx))
+    double y0 = Math.max(0, Math.floor(by))
+    double x1 = Math.min(server.getWidth(),  Math.ceil(bx + bw))
+    double y1 = Math.min(server.getHeight(), Math.ceil(by + bh))
+
+    // remove old tiles
+    def oldTiles = getAnnotationObjects().findAll { (it.getName() ?: "").startsWith(baseAnn.getName() + " — Tile") }
+    if (!oldTiles.isEmpty()) removeObjects(oldTiles)
+
+    def annH = findClone(baseAnn, 'Hoechst')
+    def annP = findClone(baseAnn, 'PI')
+    def annC = findClone(baseAnn, 'Calcein')
+
+    def hCells = (annH ? getDetectionObjects().findAll { it.getParent() == annH && it.hasROI() } : [])
+    def pCells = (annP ? getDetectionObjects().findAll { it.getParent() == annP && it.hasROI() } : [])
+    def cCells = (annC ? getDetectionObjects().findAll { it.getParent() == annC && it.hasROI() } : [])
+
+    def tiles = []
+
+    // --- Build grid of tiles, but CLIPPED to the annotation ROI (works for polygon/brush) ---
+    for (double y = y0; y < y1; y += tileHpx) {
+        double h = Math.min(tileHpx, y1 - y); if (h <= 0) break
+        for (double x = x0; x < x1; x += tileWpx) {
+            double w = Math.min(tileWpx, x1 - x); if (w <= 0) break
+
+            // 1) Start with the rectangular candidate tile
+            def rectROI = ROIs.createRectangleROI(x, y, w, h, ImagePlane.getDefaultPlane())
+
+            // 2) Intersect with your annotation ROI (polygon / brush / whatever)
+            def clippedROI = RoiTools.combineROIs(rectROI, bROI, RoiTools.CombineOp.INTERSECT)
+
+            // 3) Skip tiles that don't overlap the annotation at all
+            if (clippedROI == null || clippedROI.getArea() <= 0.0)
+                continue
+
+            // 4) Use the CLIPPED ROI as the tile geometry
+            def tile = PathObjects.createAnnotationObject(clippedROI, null)
+            tile.setName(String.format("%s — Tile [%.0f,%.0f]", baseAnn.getName(), x, y))
+            addObject(tile)
+            tiles << tile
+        }
+    }
+    fireHierarchyUpdate()
+    println "INFO: Created ${tiles.size()} tiles for '${baseAnn.getName()}' (inside annotation, size ≈ ${TILE_SIZE_UM} µm)."
+
+    int nt = tiles.size(); if (nt == 0) return
+
+    def tbx = new double[nt], tby = new double[nt], tbw = new double[nt], tbh = new double[nt]
+    for (int i = 0; i < nt; i++) {
+        def r = tiles[i].getROI()
+        tbx[i] = r.getBoundsX(); tby[i] = r.getBoundsY()
+        tbw[i] = r.getBoundsWidth(); tbh[i] = r.getBoundsHeight()
+    }
+
+    int[] hArr  = new int[nt]
+    int[] piArr = new int[nt]
+    int[] caArr = new int[nt]
+
+    // Also accumulate intensity sums to compute per-tile mean cell intensities
+    double[] sumR = new double[nt]; int[] nR = new int[nt]
+    double[] sumG = new double[nt]; int[] nG = new int[nt]
+    double[] sumB = new double[nt]; int[] nB = new int[nt]
+
+    def binOne = { obj, int[] counterArr, String keyMean, double[] sumArr, int[] nArr ->
+        def r = obj.getROI()
+        double cx = r.getCentroidX(), cy = r.getCentroidY()
+        for (int i = 0; i < nt; i++) {
+            if (cx >= tbx[i] && cx < tbx[i] + tbw[i] &&
+                cy >= tby[i] && cy < tby[i] + tbh[i]) {
+                counterArr[i] = counterArr[i] + 1
+                // add intensity mean if available
+                double v = mval(obj.getMeasurementList(), keyMean)
+                if (!Double.isNaN(v)) { sumArr[i] += v; nArr[i]++ }
+                break
+            }
+        }
+    }
+
+    hCells.each { binOne(it, hArr,  KEY_B, sumB, nB) }
+    pCells.each { binOne(it, piArr, KEY_R, sumR, nR) }
+    cCells.each { binOne(it, caArr, KEY_G, sumG, nG) }
+
+    def toRemove = []
+    def bgPairs = new ArrayList()  // pairs of [tile, bgAnn]
+
+    for (int i = 0; i < nt; i++) {
+        def tileROI = tiles[i].getROI()
+
+        // Compute actual tile area & area fraction relative to intended full tile
+        double tileAreaPx  = areaOf(tileROI)
+        double tileAreaUm2 = tileAreaPx * umPerPx * umPerPx
+        double areaFrac    = (fullTileAreaUm2 > 0) ? Math.min(1.0, tileAreaUm2 / fullTileAreaUm2) : 1.0
+        int minPerThisTile = Math.max(1, (int)Math.round(MIN_PER_CHANNEL * areaFrac))
+
+        // ---------- Unions & PI/CAL area (inside tile) ----------
+        def unionOp = (RoiTools.CombineOp.values()*.name().contains('UNION')) ?
+                RoiTools.CombineOp.valueOf('UNION') : RoiTools.CombineOp.ADD
+
+        def piUnion = null
+        def calUnion = null
+        def allUnion = null  // union of H, PI, CAL (for occupied cell area)
+
+        pCells.each { p ->
+            def inter = RoiTools.combineROIs(p.getROI(), tileROI, RoiTools.CombineOp.INTERSECT)
+            if (areaOf(inter) > 0.0) {
+                piUnion = (piUnion == null) ? inter : RoiTools.combineROIs(piUnion, inter, unionOp)
+                allUnion = (allUnion == null) ? inter : RoiTools.combineROIs(allUnion, inter, unionOp)
+            }
+        }
+        cCells.each { c ->
+            def inter = RoiTools.combineROIs(c.getROI(), tileROI, RoiTools.CombineOp.INTERSECT)
+            if (areaOf(inter) > 0.0) {
+                calUnion = (calUnion == null) ? inter : RoiTools.combineROIs(calUnion, inter, unionOp)
+                allUnion = (allUnion == null) ? inter : RoiTools.combineROIs(allUnion, inter, unionOp)
+            }
+        }
+        hCells.each { h ->
+            def inter = RoiTools.combineROIs(h.getROI(), tileROI, RoiTools.CombineOp.INTERSECT)
+            if (areaOf(inter) > 0.0) {
+                allUnion = (allUnion == null) ? inter : RoiTools.combineROIs(allUnion, inter, unionOp)
+            }
+        }
+
+        double areaPI_um2   = areaOf(piUnion)  * umPerPx * umPerPx
+        double areaCAL_um2  = areaOf(calUnion) * umPerPx * umPerPx
+        double occCell_um2  = areaOf(allUnion) * umPerPx * umPerPx   // total occupied cell area in tile
+
+        // PI fraction and ratio
+        double denom  = areaPI_um2 + areaCAL_um2
+        double piFrac = (denom > 0.0) ? (areaPI_um2 / denom) : Double.NaN
+        double ratioPIoverCAL = (areaCAL_um2 > 0.0) ? (areaPI_um2 / areaCAL_um2) : Double.NaN
+
+        // ---------- BACKGROUND mask ----------
+        def hasSubtract = RoiTools.CombineOp.values()*.name().contains('SUBTRACT')
+        def subtractOp  = hasSubtract ? RoiTools.CombineOp.valueOf('SUBTRACT') : null
+
+        def bgROI = (allUnion == null) ? tileROI :
+                    (hasSubtract ? RoiTools.combineROIs(tileROI, allUnion, subtractOp) : null)
+
+        double bgAreaPx  = areaOf(bgROI)
+        double bgAreaUm2 = bgAreaPx * umPerPx * umPerPx
+
+        if (bgROI != null && bgAreaPx > 0.0) {
+            def bgAnn = PathObjects.createAnnotationObject(bgROI, null)
+            bgAnn.setName(String.format("%s — Tile BG [%.0f,%.0f]", baseAnn.getName(), tbx[i], tby[i]))
+            addObject(bgAnn)
+            bgPairs << [tile: tiles[i], bg: bgAnn]
+        } else if (!hasSubtract && allUnion != null) {
+            println "WARN: SUBTRACT op not available; skipping background for a tile under '${baseAnn.getName()}'."
+        }
+
+        // ---------- Keep/drop rule (AREA-NORMALIZED) ----------
+        boolean keep = (hArr[i]  >= minPerThisTile) ||
+                       (piArr[i] >= minPerThisTile) ||
+                       (caArr[i] >= minPerThisTile)
+
+        // ---------- Stamp per-tile metrics now (some values filled later) ----------
+        def ml = tiles[i].getMeasurementList()
+        ml.put('Tile area (µm²)',                 tileAreaUm2)
+        ml.put('Tile area fraction of full',      areaFrac)
+        ml.put('Tile count Hoechst',              (double)hArr[i])
+        ml.put('Tile count PI',                   (double)piArr[i])
+        ml.put('Tile count Calcein',              (double)caArr[i])
+        ml.put('Tile union area PI (µm²)',        areaPI_um2)
+        ml.put('Tile union area CAL (µm²)',       areaCAL_um2)
+        ml.put('Tile occupied cell area (µm²)',   occCell_um2)
+        ml.put('Tile PI fraction',                piFrac)
+        ml.put('Tile PI/CAL area ratio',          ratioPIoverCAL)
+        ml.put('Tile passes filter (any channel ≥ min)', keep ? 1.0 : 0.0)
+        ml.put('Tile BG area (µm²)',              bgAreaUm2)
+
+        // Placeholders for BG means & cell means & ratios (filled after BG measurement)
+        ml.put('Tile BG mean PI',            Double.NaN)
+        ml.put('Tile BG mean Calcein',       Double.NaN)
+        ml.put('Tile BG mean Hoechst',       Double.NaN)
+        ml.put('Tile mean cell PI',          (nR[i] > 0 ? (sumR[i]/nR[i]) : Double.NaN))
+        ml.put('Tile mean cell Calcein',     (nG[i] > 0 ? (sumG[i]/nG[i]) : Double.NaN))
+        ml.put('Tile mean cell Hoechst',     (nB[i] > 0 ? (sumB[i]/nB[i]) : Double.NaN))
+        ml.put('Tile cell/BG ratio PI',      Double.NaN)
+        ml.put('Tile cell/BG ratio Calcein', Double.NaN)
+        ml.put('Tile cell/BG ratio Hoechst', Double.NaN)
+
+        // Update tile name with quick summary
+        String fracStr  = Double.isNaN(piFrac) ? "NaN" : String.format("%.2f", piFrac)
+        String ratioStr = Double.isNaN(ratioPIoverCAL) ? "NaN" : String.format("%.2f", ratioPIoverCAL)
+        tiles[i].setName(String.format("%s — Tile H=%d, PI=%d, CAL=%d, PIfrac=%s, Ratio=%s",
+                baseAnn.getName(), hArr[i], piArr[i], caArr[i], fracStr, ratioStr))
+
+        if (!keep) toRemove << tiles[i]
+    }
+
+    // Batch measure BG means on all BG annotations we created
+    def bgAnnsAll = bgPairs.collect { it.bg }
+    if (!bgAnnsAll.isEmpty()) {
+        measureBGMeansRGB_on(bgAnnsAll)
+        // Stamp the BG means & compute ratios on tiles using the saved pairs
+        bgPairs.each { pair ->
+            def t = pair.tile
+            def bga = pair.bg
+            def mlb = bga.getMeasurementList()
+            double r = pickMean(mlb, 'red')
+            double g = pickMean(mlb, 'green')
+            double b = pickMean(mlb, 'blue')
+
+            def mlt = t.getMeasurementList()
+            mlt.put('Tile BG mean PI',      r)  // Red -> PI
+            mlt.put('Tile BG mean Calcein', g)  // Green -> Calcein
+            mlt.put('Tile BG mean Hoechst', b)  // Blue -> Hoechst
+
+            double cellR = mval(mlt, 'Tile mean cell PI')
+            double cellG = mval(mlt, 'Tile mean cell Calcein')
+            double cellB = mval(mlt, 'Tile mean cell Hoechst')
+
+            mlt.put('Tile cell/BG ratio PI',      (r > 0 && Double.isFinite(cellR)) ? (cellR / r) : Double.NaN)
+            mlt.put('Tile cell/BG ratio Calcein', (g > 0 && Double.isFinite(cellG)) ? (cellG / g) : Double.NaN)
+            mlt.put('Tile cell/BG ratio Hoechst', (b > 0 && Double.isFinite(cellB)) ? (cellB / b) : Double.NaN)
+
+            removeObjectAndDescendants(bga)     // clean up BG objects
+        }
+        fireHierarchyUpdate()
+    }
+
+    if (!toRemove.isEmpty()) {
+        def clsRemoved = getPathClass("Tile - Removed", (0xFF<<24)|(158<<16)|(158<<8)|158) // gray
+        toRemove.each { t ->
+            t.setPathClass(clsRemoved)
+            // keep the measurement stamped earlier:
+            // 'Tile passes filter (any channel ≥ min)' = 0
+        }
+        println "INFO: Marked ${toRemove.size()} tiles as 'Removed' (kept for export)."
+    } else {
+    println "INFO: All tiles passed the OR rule."
+    }
+fireHierarchyUpdate()
+}
+
+// Run tiles on processed bases
+getAnnotationObjects()
+    .findAll { it.hasROI() && (PROCESS_ALL_ANNOTATIONS || (it.getName() == ONLY_ANN_NAME)) }
+    .each { createTilesAndFilter(it) }
+
+
+// ====== Color tiles by ABSOLUTE PI FRACTION (Alive / Mixed / Dead), skipping removed tiles ======
+def colorTilesByAbsolute = { boolean processAll, String onlyName, double lowMax, double highMin ->
+    final int COL_ALIVE = (0xFF<<24)|( 76<<16)|(175<<8)| 80   // green
+    final int COL_MIXED = (0xFF<<24)|(255<<16)|(193<<8)|  7   // amber
+    final int COL_DEAD  = (0xFF<<24)|(229<<16)|( 57<<8)| 53   // red
+
+    def clsAlive = getPathClass(String.format("Tile - Alive (PIfrac<%.2f)", lowMax), COL_ALIVE)
+    def clsMixed = getPathClass("Tile - Mixed",                                    COL_MIXED)
+    def clsDead  = getPathClass(String.format("Tile - Dead (PIfrac≥%.2f)", highMin), COL_DEAD)
+
+    def bases = getAnnotationObjects().findAll { it.hasROI() }
+    if (!processAll) {
+        def a = bases.find { it.getName() == onlyName }
+        bases = a ? [a] : []
+    }
+    if (bases.isEmpty()) return
+
+    for (baseAnn in bases) {
+        // Collect tiles under this base, then filter out removed ones
+        def tilesHere = getAnnotationObjects().findAll { obj ->
+            def nm = (obj.getName() ?: "")
+            nm.startsWith(baseAnn.getName() + " — Tile") || nm.startsWith(baseAnn.getName() + " - Tile")
+        }
+
+        // Keep only tiles that passed the min-count filter AND are not classed as "Tile - Removed"
+        tilesHere = tilesHere.findAll { t ->
+            def clsName = t.getPathClass()?.getName() ?: ""
+            if (clsName == "Tile - Removed") return false
+            def ml = t.getMeasurementList()
+            def v = (ml != null ? ml.get('Tile passes filter (any channel ≥ min)') : null)
+            double pass = (v instanceof Number) ? (v as double) : Double.NaN
+            return Double.isFinite(pass) && pass == 1.0
+        }
+
+        if (tilesHere.isEmpty()) {
+            println "INFO: No kept tiles to color under '${baseAnn.getName()}'."
+            continue
+        }
+
+        int nAlive=0, nMixed=0, nDead=0
+        for (t in tilesHere) {
+            def ml = t.getMeasurementList()
+            double aPI  = (ml?.get('Tile union area PI (µm²)')  instanceof Number) ? (ml.get('Tile union area PI (µm²)')  as double) : Double.NaN
+            double aCAL = (ml?.get('Tile union area CAL (µm²)') instanceof Number) ? (ml.get('Tile union area CAL (µm²)') as double) : Double.NaN
+            double frac = (ml?.get('Tile PI fraction') instanceof Number) ? (ml.get('Tile PI fraction') as double) :
+                          ((aPI + aCAL) > 0.0 ? aPI/(aPI+aCAL) : Double.NaN)
+
+            if (!Double.isFinite(frac)) {
+                if (aCAL <= 0.0 && aPI > 0.0) { t.setPathClass(clsDead);  nDead++  }
+                else if (aPI <= 0.0 && aCAL > 0.0) { t.setPathClass(clsAlive); nAlive++ }
+                else { t.setPathClass(clsMixed); nMixed++ }
+                continue
+            }
+
+            if (frac < lowMax) { t.setPathClass(clsAlive); nAlive++ }
+            else if (frac >= highMin) { t.setPathClass(clsDead); nDead++ }
+            else { t.setPathClass(clsMixed); nMixed++ }
+        }
+        fireHierarchyUpdate()
+        println String.format(
+            "INFO: Colored kept tiles for '%s' -> alive=%d, mixed=%d, dead=%d (alive<%.2f, dead≥%.2f)",
+            baseAnn.getName(), nAlive, nMixed, nDead, lowMax, highMin
+        )
+    }
+}
+
+colorTilesByAbsolute(PROCESS_ALL_ANNOTATIONS, ONLY_ANN_NAME, PI_FRAC_ALIVE_MAX, PI_FRAC_DEAD_MIN)
+
+// ====== Export per-tile metrics (CSV with UTF-8 BOM) ======
+def exportTileMetrics = {
+    String imageName = getProjectEntry()?.getImageName() ?: getCurrentImageData().getServer().getShortServerName()
+    File outFile
+    def project = getProject()
+    if (project != null) {
+        def outDir = buildFilePath(PROJECT_BASE_DIR, 'exports'); mkdirs(outDir)
+        outFile = new File(outDir, "${imageName}_tiles_union_metrics.csv")
+    } else {
+        outFile = new File(System.getProperty('user.home'), "${imageName}_tiles_union_metrics.csv")
+    }
+
+    def tiles = getAnnotationObjects().findAll { (it.getName() ?: "").contains(" — Tile") }
+    def pw = makeCsvWriter(outFile)
+    pw.println("TileName,CentroidX,CentroidY,Tile area (µm²),Tile area fraction of full,Tile count Hoechst,Tile count PI,Tile count Calcein,Tile union area PI (µm²),Tile union area CAL (µm²),Tile occupied cell area (µm²),Tile PI fraction,Tile PI/CAL area ratio,Tile passes filter (any channel ≥ min),Tile BG area (µm²),Tile BG mean PI,Tile BG mean Calcein,Tile BG mean Hoechst,Tile mean cell PI,Tile mean cell Calcein,Tile mean cell Hoechst,Tile cell/BG ratio PI,Tile cell/BG ratio Calcein,Tile cell/BG ratio Hoechst,TileClass,Tile PI class idx")
+    tiles.each { t ->
+        def ml = t.getMeasurementList()
+        def val = { k -> def v = ml?.get(k); (v instanceof Number) ? (v as double) : Double.NaN }
+        def r = t.getROI()
+        String clsName = t.getPathClass() != null ? t.getPathClass().getName() : ""
+        pw.println([
+            '"' + (t.getName()?.replace('"','""') ?: '') + '"',
+            r?.getCentroidX(), r?.getCentroidY(),
+            val('Tile area (µm²)'),
+            val('Tile area fraction of full'),
+            val('Tile count Hoechst'),
+            val('Tile count PI'),
+            val('Tile count Calcein'),
+            val('Tile union area PI (µm²)'),
+            val('Tile union area CAL (µm²)'),
+            val('Tile occupied cell area (µm²)'),
+            val('Tile PI fraction'),
+            val('Tile PI/CAL area ratio'),
+            val('Tile passes filter (any channel ≥ min)'),
+            val('Tile BG area (µm²)'),
+            val('Tile BG mean PI'),
+            val('Tile BG mean Calcein'),
+            val('Tile BG mean Hoechst'),
+            val('Tile mean cell PI'),
+            val('Tile mean cell Calcein'),
+            val('Tile mean cell Hoechst'),
+            val('Tile cell/BG ratio PI'),
+            val('Tile cell/BG ratio Calcein'),
+            val('Tile cell/BG ratio Hoechst'),
+            '"' + clsName.replace('"','""') + '"',
+            val('Tile PI class idx')
+        ].join(","))
+    }
+    pw.flush(); pw.close()
+    println "INFO: Wrote TILE metrics CSV: ${outFile.getAbsolutePath()}"
+}
+exportTileMetrics()
+
+// ====== Export per-cell (CSV with UTF-8 BOM) ======
+def exportAllChannelsPerCell = { boolean processAll, String onlyName ->
+    String imageName = getProjectEntry()?.getImageName() ?: getCurrentImageData().getServer().getShortServerName()
+    File outFile
+    def project = getProject()
+    if (project != null) {
+        def outDir = buildFilePath(PROJECT_BASE_DIR, 'exports'); mkdirs(outDir)
+        outFile = new File(outDir, "${imageName}_per_cell_allchannels.csv")
+    } else {
+        outFile = new File(System.getProperty('user.home'), "${imageName}_per_cell_allchannels.csv")
+    }
+
+    def bases = getBases(processAll, onlyName)
+    def pw = makeCsvWriter(outFile)
+
+    def server = getCurrentImageData().getServer()
+    def cal    = server.getPixelCalibration()
+    double umPerPx = (cal == null) ? 1.0 : cal.getAveragedPixelSizeMicrons()
+    double um2PerPx2 = umPerPx * umPerPx
+    def areaUm2 = { roi -> (roi == null) ? Double.NaN : (roi.getArea() * um2PerPx2) }
+    def equivDiamUm = { aUm2 -> (Double.isFinite(aUm2) && aUm2 > 0.0) ? 2.0*Math.sqrt(aUm2/Math.PI) : Double.NaN }
+
+    pw.println("BaseAnnotation,Source,Index,CentroidX,CentroidY,CentroidZ,H_flag,PI_flag,CAL_flag,category7,tripleClass,R_PI_mean,G_CAL_mean,B_HOE_mean,H_area_um2,H_equiv_diam_um,PI_area_um2,PI_equiv_diam_um,CAL_area_um2,CAL_equiv_diam_um,H_partners_PI_n,H_partners_CAL_n,H_triple_pairs_n,H_partners_PI_ids,H_partners_CAL_ids")
+
+    bases.each { baseAnn ->
+        def annH = findClone(baseAnn, 'Hoechst')
+        def annP = findClone(baseAnn, 'PI')
+        def annC = findClone(baseAnn, 'Calcein')
+
+        def hCells = (annH ? getDetectionObjects().findAll { it.getParent() == annH && it.hasROI() } : [])
+        def pCells = (annP ? getDetectionObjects().findAll { it.getParent() == annP && it.hasROI() } : [])
+        def cCells = (annC ? getDetectionObjects().findAll { it.getParent() == annC && it.hasROI() } : [])
+
+        int idxH = 0
+        hCells.each { h ->
+            idxH++
+            def hROI = h.getROI()
+            def pCands = pCells.collect { p -> [p, areaOf(RoiTools.combineROIs(hROI, p.getROI(), RoiTools.CombineOp.INTERSECT))] }
+                               .findAll { it[1] > 0.0 }
+            def cCands = cCells.collect { c -> [c, areaOf(RoiTools.combineROIs(hROI, c.getROI(), RoiTools.CombineOp.INTERSECT))] }
+                               .findAll { it[1] > 0.0 }
+
+            def pBest = pCands.isEmpty() ? null : pCands.max{ it[1] }[0]
+            def cBest = cCands.isEmpty() ? null : cCands.max{ it[1] }[0]
+
+            boolean overlapsP = pBest != null
+            boolean overlapsC = cBest != null
+
+            Double clsNum = mval(h.getMeasurementList(), "Triple overlap class")
+            String tclass = (clsNum == 1.0) ? "Single" : (clsNum == 2.0 ? "Several" : (clsNum == 0.0 ? "None" : ""))
+
+            String cat =
+                overlapsP && overlapsC ? "H + PI + CAL" :
+                overlapsP && !overlapsC ? "H + PI" :
+                !overlapsP && overlapsC ? "H + CAL" : "H only"
+
+            double R = overlapsP ? mval(pBest.getMeasurementList(), KEY_R) : Double.NaN
+            double G = overlapsC ? mval(cBest.getMeasurementList(), KEY_G) : Double.NaN
+            double B = mval(h.getMeasurementList(), KEY_B)
+
+            double aH = areaUm2(hROI)
+            double dH = equivDiamUm(aH)
+
+            pw.println([
+                baseAnn.getName(), "H", idxH,
+                hROI.getCentroidX(), hROI.getCentroidY(), centroidZSafe(hROI),
+                1, overlapsP ? 1 : 0, overlapsC ? 1 : 0,
+                cat, tclass,
+                R, G, B,
+                aH, dH, "", "", "", "",
+                mval(h.getMeasurementList(), "H partners PI (n)"),
+                mval(h.getMeasurementList(), "H partners CAL (n)"),
+                mval(h.getMeasurementList(), "H triple pairs (n)"),
+                '"' + ((h.getMeasurementList()?.get("H partners PI ids")  ?: "") as String).replace('"','""') + '"',
+                '"' + ((h.getMeasurementList()?.get("H partners CAL ids") ?: "") as String).replace('"','""') + '"'
+            ].join(","))
+        }
+
+        def pNoH = pCells.findAll { p -> !hCells.any { h -> areaOf(RoiTools.combineROIs(h.getROI(), p.getROI(), RoiTools.CombineOp.INTERSECT)) > 0.0 } }
+        def cNoH = cCells.findAll { c -> !hCells.any { h -> areaOf(RoiTools.combineROIs(h.getROI(), c.getROI(), RoiTools.CombineOp.INTERSECT)) > 0.0 } }
+
+        def usedP = new HashSet()
+        def usedC = new HashSet()
+        int idxP = 0, idxC = 0, idxPair = 0
+
+        pNoH.each { p ->
+            if (usedP.contains(p)) return
+            def pROI = p.getROI()
+            def cCands = cNoH.findAll { c -> !usedC.contains(c) && areaOf(RoiTools.combineROIs(pROI, c.getROI(), RoiTools.CombineOp.INTERSECT)) > 0.0 }
+            if (!cCands.isEmpty()) {
+                def bestC = null; double bestA = -1
+                cCands.each { c -> double a = areaOf(RoiTools.combineROIs(pROI, c.getROI(), RoiTools.CombineOp.INTERSECT)); if (a > bestA) { bestA = a; bestC = c } }
+                usedP.add(p); usedC.add(bestC); idxPair++
+
+                double cx = (pROI.getCentroidX() + bestC.getROI().getCentroidX()) / 2.0
+                double cy = (pROI.getCentroidY() + bestC.getROI().getCentroidY()) / 2.0
+                Double z1 = zFromROI(pROI); Double z2 = zFromROI(bestC.getROI())
+                String cz = (z1 != null && z2 != null) ? ("" + ((z1 + z2)/2.0)) : ""
+
+                double R = mval(p.getMeasurementList(), KEY_R)
+                double G = mval(bestC.getMeasurementList(), KEY_G)
+
+                double aP = areaUm2(pROI), dP = equivDiamUm(aP)
+                double aC = areaUm2(bestC.getROI()), dC = equivDiamUm(aC)
+
+                pw.println([ baseAnn.getName(), "PI+CAL(no H)", idxPair,
+                             cx, cy, cz, 0, 1, 1, "PI + CAL", "",
+                             R, G, "",
+                             "", "",
+                             aP, dP,
+                             aC, dC,
+                             "", "", "", "", ""
+                ].join(","))
+            }
+        }
+
+        pNoH.findAll { !usedP.contains(it) }.each { p ->
+            idxP++
+            def r = p.getROI()
+            double R = mval(p.getMeasurementList(), KEY_R)
+            double aP = areaUm2(r), dP = equivDiamUm(aP)
+
+            pw.println([ baseAnn.getName(), "PI", idxP,
+                         r.getCentroidX(), r.getCentroidY(), centroidZSafe(r),
+                         0, 1, 0, "PI only", "",
+                         R, "", "",
+                         "", "",
+                         aP, dP,
+                         "", "",
+                         "", "", "", "", ""
+            ].join(","))
+        }
+
+        cNoH.findAll { !usedC.contains(it) }.each { c ->
+            idxC++
+            def r = c.getROI()
+            double G = mval(c.getMeasurementList(), KEY_G)
+            double aC = areaUm2(r), dC = equivDiamUm(aC)
+
+            pw.println([ baseAnn.getName(), "CAL", idxC,
+                         r.getCentroidX(), r.getCentroidY(), centroidZSafe(r),
+                         0, 0, 1, "CAL only", "",
+                         "", G, "",
+                         "", "",
+                         "", "",
+                         aC, dC,
+                         "", "", "", "", ""
+            ].join(","))
+        }
+    }
+
+    pw.flush(); pw.close()
+    println "INFO: Wrote ALL-channel CSV (RGB + size): ${outFile.getAbsolutePath()}"
+}
+exportAllChannelsPerCell(PROCESS_ALL_ANNOTATIONS, ONLY_ANN_NAME)
+
+
+// ====== Export ALL detections' sizes (separate CSV; one row per detection) ======
+def exportAllDetectionSizesSimple = { boolean processAll, String onlyName ->
+    String imageName = getProjectEntry()?.getImageName() ?: getCurrentImageData().getServer().getShortServerName()
+    File outFile
+    def project = getProject()
+    if (project != null) {
+        def outDir = buildFilePath(PROJECT_BASE_DIR, 'exports'); mkdirs(outDir)
+        outFile = new File(outDir, "${imageName}_all_detections_sizes.csv")
+    } else {
+        outFile = new File(System.getProperty('user.home'), "${imageName}_all_detections_sizes.csv")
+    }
+
+    // pixel→µm helpers (same calibration used elsewhere)
+    def server = getCurrentImageData().getServer()
+    def cal    = server.getPixelCalibration()
+    double umPerPx    = (cal == null) ? 1.0 : cal.getAveragedPixelSizeMicrons()
+    double um2PerPx2  = umPerPx * umPerPx
+    def areaUm2       = { roi -> (roi == null) ? Double.NaN : (roi.getArea() * um2PerPx2) }
+    def equivDiamUm   = { aUm2 -> (Double.isFinite(aUm2) && aUm2 > 0.0) ? 2.0 * Math.sqrt(aUm2 / Math.PI) : Double.NaN }
+    def zSafe         = { roi -> try { def z = roi?.getZ(); z == null ? "" : ("" + (z as double)) } catch (Throwable t) { "" } }
+
+    def pw = makeCsvWriter(outFile)
+    pw.println("BaseAnnotation,Source,Index,CentroidX,CentroidY,CentroidZ,Area_um2,Equiv_diam_um")
+
+    // Which annotations to use
+    def bases = getAnnotationObjects().findAll{ it.hasROI() }
+    if (!processAll) {
+        def a = bases.find{ it.getName() == onlyName }
+        bases = a ? [a] : []
+    }
+
+    bases.each { baseAnn ->
+        // find the three clones created earlier
+        def annH = findClone(baseAnn, 'Hoechst')
+        def annP = findClone(baseAnn, 'PI')
+        def annC = findClone(baseAnn, 'Calcein')
+
+        def detsH = (annH ? getDetectionObjects().findAll { it.getParent() == annH && it.hasROI() } : [])
+        def detsP = (annP ? getDetectionObjects().findAll { it.getParent() == annP && it.hasROI() } : [])
+        def detsC = (annC ? getDetectionObjects().findAll { it.getParent() == annC && it.hasROI() } : [])
+
+        int iH = 0; detsH.each { d ->
+            iH++
+            def r = d.getROI()
+            double a = areaUm2(r)
+            double e = equivDiamUm(a)
+            pw.println([ baseAnn.getName(), "H", iH, r.getCentroidX(), r.getCentroidY(), zSafe(r), a, e ].join(","))
+        }
+
+        int iP = 0; detsP.each { d ->
+            iP++
+            def r = d.getROI()
+            double a = areaUm2(r)
+            double e = equivDiamUm(a)
+            pw.println([ baseAnn.getName(), "PI", iP, r.getCentroidX(), r.getCentroidY(), zSafe(r), a, e ].join(","))
+        }
+
+        int iC = 0; detsC.each { d ->
+            iC++
+            def r = d.getROI()
+            double a = areaUm2(r)
+            double e = equivDiamUm(a)
+            pw.println([ baseAnn.getName(), "CAL", iC, r.getCentroidX(), r.getCentroidY(), zSafe(r), a, e ].join(","))
+        }
+    }
+
+    pw.flush(); pw.close()
+    println "INFO: Wrote ALL-detection sizes CSV: ${outFile.getAbsolutePath()}"
+}
+
+// Call the new export (does not affect your existing exports)
+exportAllDetectionSizesSimple(PROCESS_ALL_ANNOTATIONS, ONLY_ANN_NAME)
+
+
+println("All done.")
